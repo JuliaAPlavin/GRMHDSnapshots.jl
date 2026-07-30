@@ -13,6 +13,14 @@
                -a*s2*tr  -a*s2*(o+tr)  z   s2*(ρ2 + a^2*s2*(o+tr)) ]
 end
 
+# Spatial-metric norm √(γᵢⱼVⁱVʲ) of a contravariant 3-vector in KS (γ = spatial part of ks_gcov): the
+# proper coordinate-invariant magnitude of V^i — a raw Euclidean component norm instead mixes the
+# radial (per-length) and angular (per-radian) parts and is not a real magnitude.
+@inline function spatial_norm(V::SVector{3}, r, θ, a)
+    γ = ks_gcov(r, θ, a)[SVector(2, 3, 4), SVector(2, 3, 4)]
+    sqrt(V'*γ*V)
+end
+
 # Gammie relative-velocity → contravariant 4-velocity u^μ (KS). Uses the closed-form KS inverse-metric
 # row g^{tμ} = (-(1+2r/ρ²), 2r/ρ², 0, 0): only u^t and u^r differ from the relative velocity.
 @inline function gammie_ucon(ũ::SVector{3}, g::SMatrix{4,4}, r, θ, a)
@@ -23,6 +31,45 @@ end
     end
     ufac = sqrt((1 + q)/(1 + tr))
     SVector(ufac*(1 + tr), ũ[1] - ufac*tr, ũ[2], ũ[3])
+end
+
+"""
+    fluid_ucon(ũ, r, θ, a)
+
+Contravariant Kerr-Schild 4-velocity `u^μ` of the fluid, reconstructed from the relative-velocity
+primitive `ũ^i` at KS `(r, θ)` with spin `a`. Needs no magnetic field (unlike `plasma_state`).
+
+The spatial part `u^{r,θ,φ}` is the fluid's flow direction; `ũ` itself is motion *relative to the
+infalling KS normal observer* and points elsewhere near the horizon (its radial component stays
+outward where the fluid is accreting inward).
+"""
+@inline fluid_ucon(ũ::SVector{3}, r, θ, a) = gammie_ucon(ũ, ks_gcov(r, θ, a), r, θ, a)
+
+"""
+    fluid_velocity(ũ, r, θ, a)
+    fluid_velocity(snap)
+
+Coordinate 3-velocity `v^i = u^i/u^t = dx^i/dt` (KS components) of the fluid: same direction as the
+flow, magnitude the coordinate speed (bounded, unlike the 4-velocity's proper-time components). The
+grid method maps it over a snapshot, `(:φ,:θ,:r)`.
+"""
+@inline function fluid_velocity(ũ::SVector{3}, r, θ, a)
+    u = fluid_ucon(ũ, r, θ, a)
+    SVector(u[2], u[3], u[4]) / u[1]
+end
+
+"""
+    flow_speed(ũ, r, θ, a)
+    flow_speed(snap)
+
+Physical 3-speed of the fluid relative to the local normal (Eulerian) observer, as a fraction of c:
+`v = √(1 − 1/γ²)`, `γ = α·uᵗ` the Lorentz factor (`α` the lapse). Bounded [0,1) and metric-correct —
+unlike a raw coordinate-component norm. The grid method maps it over a snapshot, `(:φ,:θ,:r)`.
+"""
+@inline function flow_speed(ũ::SVector{3}, r, θ, a)
+    u = fluid_ucon(ũ, r, θ, a)
+    γ = lapse(r, θ, a)*u[1]
+    sqrt(max(zero(γ), 1 - 1/γ^2))
 end
 
 # Lab 3-field B^i + 4-velocity → comoving field 4-vector b^μ (HARM convention b^t = B^i u_i).
@@ -102,6 +149,38 @@ end
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
 comoving_bsq(snap::KoralSnapshot) = _grid_map((ũ, B, r, θ, a) -> plasma_state(ũ, B, r, θ, a).bsq, snap)
+
+# Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `_grid_map` it touches
+# only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
+function _grid_map1(f, field, snap::KoralSnapshot)
+    (; r_prof, th_grid, spin) = snap
+    nφ, nθ, nr = size(field)
+    NamedDimsArray(
+        [f(field[φ=k, θ=j, r=i], r_prof[i], th_grid[i, j], spin) for k in 1:nφ, j in 1:nθ, i in 1:nr],
+        (:φ, :θ, :r))
+end
+
+"""
+    fluid_velocity(snap)
+
+Per-cell coordinate 3-velocity `v^i` [code units], as a `(:φ,:θ,:r)` array.
+"""
+fluid_velocity(snap::KoralSnapshot) = _grid_map1(fluid_velocity, snap.velrel, snap)
+
+"""
+    flow_speed(snap)
+
+Per-cell physical speed `v/c` relative to the normal observer, as a `(:φ,:θ,:r)` array.
+"""
+flow_speed(snap::KoralSnapshot) = _grid_map1(flow_speed, snap.velrel, snap)
+
+"""
+    bfield_magnitude(snap)
+
+Normal-frame magnitude of the lab 3-field `B^i`, `√(γᵢⱼBⁱBʲ)` [code units], as a `(:φ,:θ,:r)` array —
+the proper spatial-metric norm, not a raw component norm.
+"""
+bfield_magnitude(snap::KoralSnapshot) = _grid_map1(spatial_norm, snap.bfield, snap)
 
 """
     comoving_B_gauss(snap)

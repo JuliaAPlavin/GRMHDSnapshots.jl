@@ -154,6 +154,67 @@ end
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
 end
 
+@testitem "velocity direction: u^μ reconstruction & flow" begin
+    using StaticArrays
+    using GRMHDSnapshots: fluid_ucon, fluid_velocity, ks_gcov
+
+    # ũ=0 (fluid at rest wrt the KS normal observer) ⇒ pure radial infall. Closed form (hardcoded,
+    # derived independently): u^t=√(1+tr), u^r=-tr/√(1+tr), tr=2r/(r²+a²cos²θ), u^θ=u^φ=0.
+    for (r, θ, expect) in ((3.0,  π/2, SVector(1.2909944487358056, -0.5163977794943222, 0.0, 0.0)),
+                           (10.0, 0.7, SVector(1.0950145185619904, -0.18178461790895298, 0.0, 0.0)),
+                           (1.3,  1.0, SVector(1.5328487747517299, -0.8804686988620086, 0.0, 0.0)))
+        @test (@inferred fluid_ucon(SVector(0.0, 0.0, 0.0), r, θ, 0.9)) ≈ expect
+    end
+
+    # A valid, self-consistent 4-velocity: future-pointing, u·u=-1, and the ipole resynthesis
+    # ũ^i = g^{ti}α²u^t + u^i inverts it exactly (independent inverse ⇒ genuine cross-check).
+    invprim(u, r, θ, a) = let gc = inv(ks_gcov(r, θ, a)), α2 = -1/gc[1, 1]
+        SVector(gc[1, 2]*α2*u[1] + u[2], gc[1, 3]*α2*u[1] + u[3], gc[1, 4]*α2*u[1] + u[4])
+    end
+    for a in (0.0, 0.5, 0.9, 0.998), r in (1.3, 2.0, 5.0, 50.0, 500.0), θ in (0.2, π/2, 2.9),
+        ũ in (SVector(0.3, 0.1, -0.2), SVector(2.0, -0.05, 1.0), SVector(-1.0, 0.2, 3.0))
+        u = fluid_ucon(ũ, r, θ, a)
+        @test u[1] > 0
+        @test u' * ks_gcov(r, θ, a) * u ≈ -1 rtol = 1e-8
+        @test invprim(u, r, θ, a) ≈ ũ
+        @test fluid_velocity(ũ, r, θ, a) ≈ SVector(u[2], u[3], u[4]) / u[1]
+    end
+
+    # Causality: between the two horizons every future-timelike worldline has dr/dτ<0, so the
+    # reconstructed u^r is inward for ANY ũ — while the raw primitive ũ^r is not sign-constrained.
+    for a in (0.0, 0.5, 0.9, 0.998)
+        r_out = 1 + sqrt(1 - a^2); r_in = 1 - sqrt(1 - a^2)
+        rs = range(r_in + 0.05*(r_out - r_in), r_out - 0.01*(r_out - r_in), length = 6)
+        θs = range(0.1, π - 0.1, length = 5)
+        ũs = [SVector(vr, vt, vp) for vr in (-3.0, 0.0, 3.0, 20.0) for vt in (-0.5, 0.5) for vp in (-2.0, 2.0)]
+        @test all(fluid_ucon(ũ, r, θ, a)[2] < 0 for r in rs, θ in θs, ũ in ũs)
+        @test any(ũ -> ũ[1] > 0, ũs)   # ũ^r is genuinely outward for some inputs ⇒ the test discriminates
+    end
+end
+
+@testitem "field magnitudes: metric norms, not raw component norms" begin
+    using StaticArrays
+    using GRMHDSnapshots: flow_speed, spatial_norm
+
+    # flow_speed = physical v/c relative to the normal observer: 0 at rest, in [0,1), and equal to
+    # √(1-1/γ²) with γ derived the INDEPENDENT way from the relative velocity: γ=√(1+|ũ|²_spatial)
+    # (HARM identity), not via the reconstruction's u^t path that flow_speed uses internally.
+    @test flow_speed(SVector(0.0, 0.0, 0.0), 5.0, 1.0, 0.9) == 0
+    for a in (0.0, 0.9), r in (1.3, 3.0, 30.0), θ in (0.3, π/2),
+        ũ in (SVector(2.0, -0.05, 1.0), SVector(-1.0, 0.2, 3.0), SVector(0.3, 0.1, -0.2))
+        γ = sqrt(1 + spatial_norm(ũ, r, θ, a)^2)
+        @test flow_speed(ũ, r, θ, a) ≈ sqrt(1 - 1/γ^2)
+        @test 0 ≤ flow_speed(ũ, r, θ, a) < 1
+    end
+
+    # spatial_norm = √(γᵢⱼVⁱVʲ). Hardcoded against the KS 3-metric written out by hand at one cell:
+    # r=2, θ=π/2, a=0.9 ⇒ tr=2·2/4=1, ρ²=4; g_rr=1+tr=2, g_θθ=ρ²=4, g_φφ=ρ²+a²(1+tr)=4+1.62=5.62,
+    # g_rφ=-a(1+tr)=-1.8. For V=(1,1,1): |V|²=2+4+5.62+2·(-1.8)=8.02.
+    @test spatial_norm(SVector(1.0, 1.0, 1.0), 2.0, π/2, 0.9) ≈ sqrt(8.02)
+    # a raw Euclidean norm would give √3 ≈ 1.732 — materially different, i.e. the fix matters.
+    @test !isapprox(spatial_norm(SVector(1.0, 1.0, 1.0), 2.0, π/2, 0.9), sqrt(3); rtol = 0.05)
+end
+
 @testitem "_" begin
     import Aqua
     Aqua.test_all(GRMHDSnapshots; ambiguities=false)
