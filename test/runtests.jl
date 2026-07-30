@@ -13,7 +13,7 @@ using TestItemRunner
     @test size(grid.th_grid) == (48, 32)
 
     snap = load_koral(store, "snap002000")
-    @test snap isa KoralSnapshot
+    @test snap isa GRMHDSnapshot
     @test size(snap.rho) == (24, 32, 48)
     @test size(snap.velrel) == (24, 32, 48)
     @test size(snap.bfield) == (24, 32, 48)
@@ -268,6 +268,116 @@ end
     @test spatial_norm(SVector(1.0, 1.0, 1.0), 2.0, π/2, 0.9) ≈ sqrt(8.02)
     # a raw Euclidean norm would give √3 ≈ 1.732 — materially different, i.e. the fix matters.
     @test !isapprox(spatial_norm(SVector(1.0, 1.0, 1.0), 2.0, π/2, 0.9), sqrt(3); rtol = 0.05)
+end
+
+@testitem "FMKS coordinates: analytic Jacobian matches numeric" begin
+    using GRMHDSnapshots: FMKS, bl_coord, jacobian_spatial
+
+    # No data file needed — pure coordinate math (runs everywhere). The analytic spatial Jacobian must
+    # equal the finite-difference derivative of bl_coord; r = exp(X1); φ-row/column are trivial.
+    c = FMKS(startx1 = 0.57, hslope = 0.3, mks_smooth = 0.5, poly_xt = 0.82, poly_alpha = 14.0)
+    h = 1e-6
+    for X1 in (0.6, 1.5, 3.0, 6.0), X2 in (0.05, 0.3, 0.496, 0.6, 0.95)   # incl. X2<0.5 (2X2−1<0)
+        dr_dX1  = (first(bl_coord(c, X1+h, X2)) - first(bl_coord(c, X1-h, X2)))/2h
+        dth_dX1 = (last(bl_coord(c, X1+h, X2))  - last(bl_coord(c, X1-h, X2)))/2h
+        dth_dX2 = (last(bl_coord(c, X1, X2+h))  - last(bl_coord(c, X1, X2-h)))/2h
+        J = jacobian_spatial(c, X1, X2)
+        @test J[1, 1] ≈ dr_dX1  rtol = 1e-5
+        @test J[2, 1] ≈ dth_dX1 rtol = 1e-5 atol = 1e-7
+        @test J[2, 2] ≈ dth_dX2 rtol = 1e-5
+        @test J[3, 3] == 1
+        @test J[1, 2] == 0 && J[1, 3] == 0 && J[2, 3] == 0 && J[3, 1] == 0 && J[3, 2] == 0
+        @test first(bl_coord(c, X1, X2)) ≈ exp(X1)
+    end
+end
+
+@testitem "iharm FMKS loader: synthetic round-trip" begin
+    using HDF5, StaticArrays, AxisKeys
+    using GRMHDSnapshots: FMKS, bl_coord, jacobian_spatial, plasma_state, ks_gcov
+
+    # Write a tiny valid FMKS dump and load it — exercises header parsing, prims unpacking, the grid
+    # build and the native→KS Jacobian transform end-to-end, with no external fixture (CI-safe).
+    n1, n2, n3, nprim = 4, 3, 2, 8
+    sx1, sx2, sx3 = 0.5, 0.0, 0.0
+    dx1, dx2, dx3 = 0.4, 1/n2, 2π/n3
+    par = (a = 0.7, hslope = 0.3, mks_smooth = 0.5, poly_xt = 0.82, poly_alpha = 14.0)
+    prims = reshape(collect(1:nprim*n3*n2*n1) .* 0.01, nprim, n3, n2, n1)   # deterministic, small ⇒ valid ũ
+
+    path = joinpath(mktempdir(), "mini_fmks.h5")
+    h5open(path, "w") do h5
+        write(h5, "header/metric", "FMKS")
+        write(h5, "header/n1", n1); write(h5, "header/n2", n2); write(h5, "header/n3", n3)
+        write(h5, "header/gam", 1.444444); write(h5, "t", 123.0)
+        write(h5, "header/geom/startx1", sx1); write(h5, "header/geom/startx2", sx2); write(h5, "header/geom/startx3", sx3)
+        write(h5, "header/geom/dx1", dx1); write(h5, "header/geom/dx2", dx2); write(h5, "header/geom/dx3", dx3)
+        write(h5, "header/geom/mmks/a", par.a); write(h5, "header/geom/mmks/hslope", par.hslope)
+        write(h5, "header/geom/mmks/mks_smooth", par.mks_smooth)
+        write(h5, "header/geom/mmks/poly_xt", par.poly_xt); write(h5, "header/geom/mmks/poly_alpha", par.poly_alpha)
+        write(h5, "prims", prims)
+    end
+
+    snap = load_iharm(path)
+    @test size(snap.rho) == (n3, n2, n1) && size(snap.velrel) == (n3, n2, n1)
+    @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
+    @test snap.M_unit === missing && snap.MBH === missing         # scale-free by default
+    @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
+
+    c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
+    for i in 1:n1, j in 1:n2, k in 1:n3
+        X1 = sx1 + (i-0.5)*dx1; X2 = sx2 + (j-0.5)*dx2
+        r, th = bl_coord(c, X1, X2); J = jacobian_spatial(c, X1, X2)
+        @test snap.r_prof[i] ≈ r
+        @test snap.th_grid[i, j] ≈ th
+        @test snap.rho[φ=k, θ=j, r=i] ≈ prims[1, k, j, i]
+        @test snap.velrel[φ=k, θ=j, r=i] ≈ J*SVector(prims[3, k, j, i], prims[4, k, j, i], prims[5, k, j, i])
+        @test snap.bfield[φ=k, θ=j, r=i] ≈ J*SVector(prims[6, k, j, i], prims[7, k, j, i], prims[8, k, j, i])
+        u = plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i], r, th, par.a).u
+        @test u' * ks_gcov(r, th, par.a) * u ≈ -1 rtol = 1e-10   # valid 4-velocity after transform
+    end
+end
+
+@testitem "iharm FMKS loader: real data + pyharm golden (optional, isfile-guarded)" begin
+    using StaticArrays, AxisKeys
+    using GRMHDSnapshots: plasma_state, ks_gcov
+
+    path = joinpath(@__DIR__, "data", "iharm_fmks_a0.h5")
+    if isfile(path)
+        snap = load_iharm(path)
+        @test size(snap.rho) == (128, 128, 288)
+        @test r_min(snap) < r_max(snap) && all(>(0), diff(snap.r_prof))
+        @test snap.spin == 0.0
+
+        # lazy units: scale-free by default ⇒ throw; supplied ⇒ positive scalars.
+        @test_throws ArgumentError lunit(snap)
+        snapu = load_iharm(path; M_unit = 1e26, MBH = 1.3e43)
+        @test lunit(snapu) > 0 && rhounit(snapu) > 0 && bunit(snapu) > 0
+        # auto-detect routes an FMKS .h5 to load_iharm.
+        @test load_snapshot(path).rho == snap.rho
+
+        # Golden values from pyharm (see gen_fmks_golden.py), an independent reference reader.
+        # 0-based native (i=radial, j=θ, k=φ); bsq/sigma/Gamma are frame-invariant ⇒ compared directly.
+        gold = [(59, 63, 9,    6.56053574719, 1.56595075338, 0.68453335762,  0.00538246981389,  0.0078629766599,  1.1482527967),
+                (119, 39, 69,  24.5568056735, 1.29190538653, 0.162381529808, 0.000236250350958, 0.00145490901112, 1.02877584453),
+                (29, 99, 4,    3.39096277761, 2.02063373719, 0.0109128253534, 0.382428746929,   35.0439720735,    1.02475536928),
+                (199, 109, 119, 142.719055604, 2.37849777729, 0.0111680263653, 9.7388717037e-6, 0.000872031582404, 1.00266551412)]
+        for (i, j, k, rg, thg, rhog, bsqg, sigg, Gamg) in gold
+            I, J, K = i+1, j+1, k+1
+            r = snap.r_prof[I]; th = snap.th_grid[I, J]; a = snap.spin
+            rho = snap.rho[φ=K, θ=J, r=I]
+            ps = plasma_state(snap.velrel[φ=K, θ=J, r=I], snap.bfield[φ=K, θ=J, r=I], r, th, a)
+            Γ = lapse(r, th, a) * ps.u[1]
+            @test r ≈ rg rtol = 1e-8
+            @test th ≈ thg rtol = 1e-8
+            @test rho ≈ rhog rtol = 1e-6
+            @test ps.bsq ≈ bsqg rtol = 1e-6
+            @test ps.bsq/rho ≈ sigg rtol = 1e-6
+            @test Γ ≈ Gamg rtol = 1e-6
+            @test ps.u' * ks_gcov(r, th, a) * ps.u ≈ -1 rtol = 1e-8
+            @test ps.b' * ks_gcov(r, th, a) * ps.u ≈ 0 atol = 1e-6*sqrt(max(ps.bsq, eps()))
+        end
+    else
+        @test_skip "iharm FMKS fixture absent"
+    end
 end
 
 @testitem "_" begin

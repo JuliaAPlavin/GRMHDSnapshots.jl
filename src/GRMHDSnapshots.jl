@@ -11,11 +11,16 @@ import Adapt
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
-export KoralSnapshot, load_koral, load_grid, r_min, r_max,
+export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_grid, r_min, r_max,
     plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
-struct KoralSnapshot{Ar, Av, Ab, Rp, Tg, T}
+include("coordinates.jl")
+
+# `M_unit`/`MBH` carry their own type parameter `U`: `Float64` when physical units are known,
+# `Missing` for scale-free dumps (e.g. iharm3d/KHARMA) loaded without them — then the unit scalars
+# `lunit`/`rhounit`/`bunit` throw rather than silently returning `missing`.
+struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, U}
     rho::Ar
     velrel::Av
     bfield::Ab
@@ -26,8 +31,42 @@ struct KoralSnapshot{Ar, Av, Ab, Rp, Tg, T}
     spin::T
     gam::T
     t::T
-    M_unit::T
-    MBH::T
+    M_unit::U
+    MBH::U
+end
+
+"""
+    load_snapshot(path; kwargs...)
+
+Load a single GRMHD snapshot, auto-detecting the on-disk format:
+- `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref)), read in memory;
+- `.h5` with a `quants/` group → koral ([`load_koral`](@ref)), memory-mapped;
+- a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref)).
+
+Memory-mapping is chosen for the caller: koral `.h5` is mmapped, iharm reads in memory (its
+velocity/field components are reconstructed, not stored, so there is nothing to map). `kwargs...`
+go to the selected loader (e.g. `M_unit`/`MBH` for iharm); use the explicit loaders for full control.
+"""
+function load_snapshot(path::AbstractString; kwargs...)
+    p = rstrip(path, '/')
+    snapshot_format(p) === :iharm && return load_iharm(p; kwargs...)
+    endswith(p, ".h5") ? load_koral(p; mmap = true, kwargs...) : load_koral(p; kwargs...)
+end
+
+"""
+    snapshot_format(path) -> Symbol
+
+Detect a snapshot's on-disk format: `:iharm` for an iharm3d/KHARMA `.h5` dump (a `prims` dataset),
+or `:koral` for the koral layout (a `.h5` with a `quants/` group, or a Zarr snapshot path).
+"""
+function snapshot_format(path::AbstractString)
+    p = rstrip(path, '/')
+    endswith(p, ".h5") || return :koral        # Zarr snapshot/run path
+    h5open(p, "r") do h5
+        haskey(h5, "quants") ? :koral :
+        haskey(h5, "prims")  ? :iharm :
+        throw(ArgumentError("unrecognized HDF5 snapshot format (no `quants/` or `prims`): $p"))
+    end
 end
 
 """
@@ -40,7 +79,7 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 - `kwargs...`: Forwarded to the selected loader.
 
 # Returns
-- `KoralSnapshot`.
+- `GRMHDSnapshot`.
 """
 function load_koral(path::AbstractString; kwargs...)
     p = rstrip(path, '/')
@@ -77,7 +116,7 @@ function load_koral_h5(path::AbstractString; mmap=false)
         φ0 = φ0_file + π
 
         rdscalar(name) = Float64(read(h5[name]))
-        KoralSnapshot(rho, velrel, bfield, r_prof, th_grid, φ0, dφ,
+        GRMHDSnapshot(rho, velrel, bfield, r_prof, th_grid, φ0, dφ,
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
             rdscalar("header/units/M_unit"), ustrip(u"g", rdscalar("header/units/M_bh") * u"Msun"))
     end
@@ -117,7 +156,7 @@ Load one snapshot from an open Zarr run store.
 - `grid`: Cached grid from `load_grid(store)`.
 
 # Returns
-- `KoralSnapshot`; unselected fields are `nothing`.
+- `GRMHDSnapshot`; unselected fields are `nothing`.
 """
 function load_koral(store::ZGroup, snapname::AbstractString;
                     fields = (:rho, :velrel, :bfield), grid = load_grid(store))
@@ -136,9 +175,67 @@ function load_koral(store::ZGroup, snapname::AbstractString;
 
     sc(x) = Float64(x)
     hdr = store.attrs; units = hdr["units"]
-    KoralSnapshot(rho, velrel, bfield, grid.r_prof, grid.th_grid, grid.φ0, grid.dφ,
+    GRMHDSnapshot(rho, velrel, bfield, grid.r_prof, grid.th_grid, grid.φ0, grid.dφ,
         sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
         sc(units["M_unit"]), ustrip(u"g", sc(units["M_bh"]) * u"Msun"))
+end
+
+"""
+    load_iharm(path; fields=(:rho, :velrel, :bfield), M_unit=missing, MBH=missing)
+
+Load an iharm3d/KHARMA `.h5` dump in FMKS coordinates (`header/metric` == `"FMKS"`/`"MMKS"`).
+
+The packed `prims` array holds the primitives in *native* FMKS components; the relative velocity
+`ũ^i` and lab field `B^i` are transformed to Kerr-Schild `(r, θ, φ)` components at load via the
+spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result is an ordinary
+[`GRMHDSnapshot`] that all downstream physics/interpolation handles unchanged.
+
+# Arguments
+- `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
+- `M_unit`, `MBH`: physical units in grams. These dumps are scale-free (no units stored), so pass
+  both to enable `lunit`/`rhounit`/`bunit`, or omit both (default `missing`) — those scalars then throw.
+
+# Returns
+- `GRMHDSnapshot`.
+"""
+function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
+    fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
+    (M_unit === missing) == (MBH === missing) || throw(ArgumentError("pass both M_unit and MBH, or neither"))
+    h5open(path, "r") do h5
+        rd(name) = read(h5[name])
+        metric = strip(c -> c == '\0' || c == ' ', rd("header/metric"))
+        metric in ("FMKS", "MMKS") ||
+            throw(ArgumentError("only FMKS iharm/KHARMA dumps are supported, got metric = $(repr(metric))"))
+        n1 = Int(rd("header/n1")); n2 = Int(rd("header/n2")); n3 = Int(rd("header/n3"))
+        # grid start/step under header/geom/; FMKS shape params under header/geom/mmks/ (ipole's dir for FMKS).
+        geom(name) = rd("header/geom/$name"); fmks(name) = rd("header/geom/mmks/$name")
+        sx1, sx2, sx3 = geom("startx1"), geom("startx2"), geom("startx3")
+        dx1, dx2, dx3 = geom("dx1"), geom("dx2"), geom("dx3")
+        coords = FMKS(startx1 = sx1, hslope = fmks("hslope"), mks_smooth = fmks("mks_smooth"),
+                      poly_xt = fmks("poly_xt"), poly_alpha = fmks("poly_alpha"))
+
+        # zone-centered native coords (Julia index i → 0-based i-1). r depends on X1 only, θ on (X1, X2).
+        X1(i) = sx1 + (i - 0.5)*dx1
+        X2(j) = sx2 + (j - 0.5)*dx2
+        r_prof  = Float64[first(bl_coord(coords, X1(i), X2(1))) for i in 1:n1]
+        th_grid = Float64[last(bl_coord(coords, X1(i), X2(j)))  for i in 1:n1, j in 1:n2]
+
+        # prims: HDF5 (n1,n2,n3,n_prim) row-major → Julia (n_prim,n3,n2,n1). Slots: 1=RHO, 3-5=U1-3, 6-8=B1-3.
+        prims = rd("prims")
+        nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
+        rho = :rho in fields ? nd([prims[1, k, j, i] for k in 1:n3, j in 1:n2, i in 1:n1]) : nothing
+        # native contravariant 3-vector → KS: v_KS = J₃·v_nat, J₃(r,θ) built once per (i,j) and reused over φ.
+        J = [jacobian_spatial(coords, X1(i), X2(j)) for i in 1:n1, j in 1:n2]
+        tovec(s1, s2, s3) = nd([J[i, j] * SVector(prims[s1, k, j, i], prims[s2, k, j, i], prims[s3, k, j, i])
+                                for k in 1:n3, j in 1:n2, i in 1:n1])
+        velrel = :velrel in fields ? tovec(3, 4, 5) : nothing
+        bfield = :bfield in fields ? tovec(6, 7, 8) : nothing
+
+        sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
+        # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
+        GRMHDSnapshot(rho, velrel, bfield, r_prof, th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
+            sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
+    end
 end
 
 """
@@ -147,9 +244,9 @@ end
 Minimum radial grid coordinate.
 
 # Arguments
-- `snapshot`: Loaded `KoralSnapshot`.
+- `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_min(s::KoralSnapshot) = @inbounds s.r_prof[1]
+r_min(s::GRMHDSnapshot) = @inbounds s.r_prof[1]
 
 """
     r_max(snapshot)
@@ -157,9 +254,9 @@ r_min(s::KoralSnapshot) = @inbounds s.r_prof[1]
 Maximum radial grid coordinate.
 
 # Arguments
-- `snapshot`: Loaded `KoralSnapshot`.
+- `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_max(s::KoralSnapshot) = @inbounds s.r_prof[end]
+r_max(s::GRMHDSnapshot) = @inbounds s.r_prof[end]
 
 # GPU-safe searchsortedlast.
 @inline function bsearchlast(a, x)
@@ -183,7 +280,7 @@ end
 
 # Trilinear stencil at Cartesian (x,y,z): bracket indices + weights, field-independent.
 # `n3` = φ count (same for every field). Returns `nothing` outside the radial grid.
-@inline function _sample_stencil(s::KoralSnapshot, n3, x, y, z)
+@inline function _sample_stencil(s::GRMHDSnapshot, n3, x, y, z)
     r = sqrt(x^2 + y^2 + z^2)
     (r < r_min(s) || r > r_max(s)) && return nothing
     θ = acos(clamp(z/r, -one(r), one(r)))
@@ -219,14 +316,14 @@ end
 Interpolate a single fluid field array (e.g. `snap.velrel`) at Cartesian `(x, y, z)`.
 
 # Arguments
-- `snapshot`: Loaded `KoralSnapshot`.
+- `snapshot`: Loaded `GRMHDSnapshot`.
 - `field_array`: One `(φ, θ, r)` field array, e.g. `snap.rho`, `snap.velrel`, or `snap.bfield`.
 - `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
 
 # Returns
 - Interpolated value; `zero(eltype(field_array))` outside the grid.
 """
-@inline function sample_field(s::KoralSnapshot, A, x, y, z)
+@inline function sample_field(s::GRMHDSnapshot, A, x, y, z)
     st = _sample_stencil(s, size(A, :φ), x, y, z)
     # `* one(weight)` promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
     st === nothing ? zero(eltype(A)) * one(eltype(s.r_prof)) : _apply_stencil(st, A)
@@ -238,13 +335,13 @@ end
 Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
 
 # Arguments
-- `snapshot`: Loaded `KoralSnapshot` with all fluid fields present.
+- `snapshot`: Loaded `GRMHDSnapshot` with all fluid fields present.
 - `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
 
 # Returns
 - Tuple `(rho, velrel, bfield)`.
 """
-@inline function sample(s::KoralSnapshot, x, y, z)
+@inline function sample(s::GRMHDSnapshot, x, y, z)
     st = _sample_stencil(s, size(s.rho, :φ), x, y, z)
     if st === nothing
         # Match the interpolation result type.
@@ -258,7 +355,7 @@ include("physics.jl")
 
 Adapt.adapt_structure(to, x::NamedDimsArray) = NamedDimsArray(Adapt.adapt(to, parent(x)), dimnames(x))
 
-Adapt.adapt_structure(to, s::KoralSnapshot) = KoralSnapshot(
+Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
     Adapt.adapt(to, s.rho), Adapt.adapt(to, s.velrel), Adapt.adapt(to, s.bfield),
     Adapt.adapt(to, s.r_prof), Adapt.adapt(to, s.th_grid),
     s.φ0, s.dφ, s.spin, s.gam, s.t, s.M_unit, s.MBH)

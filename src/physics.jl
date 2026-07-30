@@ -150,26 +150,30 @@ its integral over the drawn `dx dy dz` box is metric-correct. → 1 as r → ∞
 # ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
 # the downstream synchrotron code, which is plain CGS). ──
 
+# Scale-free dumps (e.g. iharm3d/KHARMA) carry no M_unit/MBH; fail loud rather than propagate `missing`.
+_require_units(snap::GRMHDSnapshot) = snap.M_unit === missing &&
+    throw(ArgumentError("snapshot has no physical units (M_unit/MBH); pass them to the loader to use lunit/rhounit/bunit"))
+
 """
     lunit(snap)
 
 Gravitational radius r_g = G·MBH/c² in cm.
 """
-lunit(snap::KoralSnapshot) = ustrip(u"cm", Unitful.G*(snap.MBH*u"g")/Unitful.c0^2)
+lunit(snap::GRMHDSnapshot) = (_require_units(snap); ustrip(u"cm", Unitful.G*(snap.MBH*u"g")/Unitful.c0^2))
 
 """
     rhounit(snap)
 
 Code mass-density unit M_unit/r_g³ in g/cm³.
 """
-rhounit(snap::KoralSnapshot) = ustrip(u"g/cm^3", (snap.M_unit*u"g")/(lunit(snap)*u"cm")^3)
+rhounit(snap::GRMHDSnapshot) = ustrip(u"g/cm^3", (snap.M_unit*u"g")/(lunit(snap)*u"cm")^3)
 
 """
     bunit(snap)
 
 Code field unit c·√(4π·ρ_unit) in Gauss.
 """
-bunit(snap::KoralSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
+bunit(snap::GRMHDSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
 
 # ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.rho. For cell (φ=k,θ=j,r=i): coords r_prof[i],
 # th_grid[i,j]; primitives velrel/bfield[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
@@ -186,7 +190,7 @@ per-cell call stays allocation-free). The Kerr-Schild metric (and hence `ps` and
 `(r,θ)`, so it is built once per `(r,θ)` slab and reused across all φ. The outer radial loop runs over
 `OhMyThreads.tmap` (`threaded`) or `map`.
 """
-function map_plasma(f, snap::KoralSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
+function map_plasma(f, snap::GRMHDSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
     rr = 1:size(snap.velrel, :r)
     slab(i) = _plasma_slab(f, snap, extras, i)      # function barrier → concrete slab element type
     slabs = threaded ? tmap(slab, rr) : map(slab, rr)
@@ -195,7 +199,7 @@ end
 
 # One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and redshift zg are built once per θ and
 # reused across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
-function _plasma_slab(f, snap::KoralSnapshot, extras, i)
+function _plasma_slab(f, snap::GRMHDSnapshot, extras, i)
     (; velrel, bfield, r_prof, th_grid, spin) = snap
     nφ, nθ = size(velrel, :φ), size(velrel, :θ)
     r = r_prof[i]
@@ -217,11 +221,11 @@ end
 
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
-comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, _, _) -> ps.bsq, snap)
+comoving_bsq(snap::GRMHDSnapshot) = map_plasma((ps, _, _) -> ps.bsq, snap)
 
 # Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
 # only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
-function _grid_map1(f, field, snap::KoralSnapshot)
+function _grid_map1(f, field, snap::GRMHDSnapshot)
     (; r_prof, th_grid, spin) = snap
     nφ, nθ, nr = size(field)
     NamedDimsArray(
@@ -234,21 +238,21 @@ end
 
 Per-cell coordinate 3-velocity `v^i` [code units], as a `(:φ,:θ,:r)` array.
 """
-fluid_velocity(snap::KoralSnapshot) = _grid_map1(fluid_velocity, snap.velrel, snap)
+fluid_velocity(snap::GRMHDSnapshot) = _grid_map1(fluid_velocity, snap.velrel, snap)
 
 """
     flow_speed(snap)
 
 Per-cell physical speed `v/c` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-flow_speed(snap::KoralSnapshot) = _grid_map1(flow_speed, snap.velrel, snap)
+flow_speed(snap::GRMHDSnapshot) = _grid_map1(flow_speed, snap.velrel, snap)
 
 """
     proper_velocity(snap)
 
 Per-cell proper velocity `βγ = √(γ²−1)` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-proper_velocity(snap::KoralSnapshot) = _grid_map1(proper_velocity, snap.velrel, snap)
+proper_velocity(snap::GRMHDSnapshot) = _grid_map1(proper_velocity, snap.velrel, snap)
 
 """
     bfield_magnitude(snap)
@@ -256,21 +260,21 @@ proper_velocity(snap::KoralSnapshot) = _grid_map1(proper_velocity, snap.velrel, 
 Normal-frame magnitude of the lab 3-field `B^i`, `√(γᵢⱼBⁱBʲ)` [code units], as a `(:φ,:θ,:r)` array —
 the proper spatial-metric norm, not a raw component norm.
 """
-bfield_magnitude(snap::KoralSnapshot) = _grid_map1(spatial_norm, snap.bfield, snap)
+bfield_magnitude(snap::GRMHDSnapshot) = _grid_map1(spatial_norm, snap.bfield, snap)
 
 """
     comoving_B_gauss(snap)
 
 Per-cell comoving field magnitude √bsq·bunit [Gauss], as a `(:φ,:θ,:r)` array.
 """
-comoving_B_gauss(snap::KoralSnapshot) = sqrt.(comoving_bsq(snap)) .* bunit(snap)
+comoving_B_gauss(snap::GRMHDSnapshot) = sqrt.(comoving_bsq(snap)) .* bunit(snap)
 
 """
     magnetization(snap)
 
 Per-cell magnetization σ = b²/ρ [code units], as a `(:φ,:θ,:r)` array. ρ=0 cells are the natural `Inf`.
 """
-magnetization(snap::KoralSnapshot) = comoving_bsq(snap) ./ snap.rho
+magnetization(snap::GRMHDSnapshot) = comoving_bsq(snap) ./ snap.rho
 
 # Replicate a φ-invariant (r,θ) field over φ into a `(:φ,:θ,:r)` array (downstream texture consistency).
 function _phi_replicate(m, nφ)
@@ -282,18 +286,18 @@ end
 
 Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-lapse(snap::KoralSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+lapse(snap::GRMHDSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
 
 """
     grav_redshift(snap)
 
 Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-grav_redshift(snap::KoralSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+grav_redshift(snap::GRMHDSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
 
 """
     volume_ratio(snap)
 
 Per-cell proper-to-coordinate volume ratio √γ/(r²sinθ), as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-volume_ratio(snap::KoralSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+volume_ratio(snap::GRMHDSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
