@@ -124,11 +124,15 @@ function load_koral(store::ZGroup, snapname::AbstractString;
     fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
     snap = store[snapname]::ZGroup
     nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
-    rd(name) = snap[name][:, :, :]
-    svf(a, b, c) = nd(StructArrays.StructArray{SVector{3,Float32}}((rd(a), rd(b), rd(c))))
-    rho    = :rho    in fields ? nd(rd("rho")) : nothing
-    velrel = :velrel in fields ? svf("U1", "U2", "U3") : nothing
-    bfield = :bfield in fields ? svf("B1", "B2", "B3") : nothing
+    rd(name) = Threads.@spawn snap[name][:, :, :]                # each zfp chunk decompresses independently
+    svf(ts) = nd(StructArrays.StructArray{SVector{3,Float32}}(map(fetch, ts)))
+    # launch every requested component up front so the reads decompress concurrently, then assemble
+    trho = :rho    in fields ? rd("rho")                   : nothing
+    tvel = :velrel in fields ? map(rd, ("U1", "U2", "U3")) : nothing
+    tbf  = :bfield in fields ? map(rd, ("B1", "B2", "B3")) : nothing
+    rho    = isnothing(trho) ? nothing : nd(fetch(trho))
+    velrel = isnothing(tvel) ? nothing : svf(tvel)
+    bfield = isnothing(tbf)  ? nothing : svf(tbf)
 
     sc(x) = Float64(x)
     hdr = store.attrs; units = hdr["units"]
