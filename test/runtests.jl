@@ -102,6 +102,58 @@ end
     end
 end
 
+@testitem "plasma physics" begin
+    using StaticArrays, Zarr, AxisKeys
+    using GRMHDSnapshots: plasma_state, ks_gcov
+
+    store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
+    snap = load_koral(store, "snap002000")
+    a = snap.spin
+
+    # Physical invariants of the reconstructed plasma state at sampled cells:
+    # u·u = -1 (timelike, normalized) and b·u = 0 (comoving field ⊥ 4-velocity), bsq ≥ 0.
+    for (i, j, k) in ((20, 16, 12), (10, 8, 3), (40, 24, 20), (5, 30, 1))
+        r = snap.r_prof[i]; θ = snap.th_grid[i, j]
+        ũ = snap.velrel[φ=k, θ=j, r=i]; B = snap.bfield[φ=k, θ=j, r=i]
+        g = ks_gcov(r, θ, a)
+        (; u, b, bsq) = plasma_state(ũ, B, r, θ, a)
+        @test u' * g * u ≈ -1 rtol = 1e-6
+        @test b' * g * u ≈ 0 atol = 1e-6 * sqrt(abs(u' * g * u) * max(bsq, eps()))
+        @test bsq ≥ 0
+    end
+
+    # Lapse → 1 far away; finite and in (0,1] at moderate r.
+    @test lapse(1e6, 1.0, a) ≈ 1 rtol = 1e-5
+    for r in (2.0, 5.0, 20.0), θ in (0.3, 1.2, 2.7)
+        α = lapse(r, θ, a)
+        @test isfinite(α) && 0 < α ≤ 1
+    end
+
+    # Grid arrays: correct shape/names, finite where ρ>0, kernel-consistent.
+    bsqg = comoving_bsq(snap)
+    @test dimnames(bsqg) == (:φ, :θ, :r)
+    @test size(bsqg) == size(snap.rho)
+    @test all(≥(0), bsqg)
+    @test all(isfinite, comoving_B_gauss(snap))
+    lap = lapse(snap)
+    @test size(lap) == size(snap.rho) && all(α -> 0 < α ≤ 1, lap)
+    σ = magnetization(snap)
+    @test all(isfinite, σ[snap.rho .> 0])
+
+    # comoving_bsq grid value equals the kernel on that cell's primitives.
+    i, j, k = 20, 16, 12
+    @test bsqg[φ=k, θ=j, r=i] ≈ plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
+                                             snap.r_prof[i], snap.th_grid[i, j], a).bsq
+
+    # Unit scalars are positive plain Float64.
+    @test lunit(snap) isa Float64 && lunit(snap) > 0
+    @test rhounit(snap) isa Float64 && rhounit(snap) > 0
+    @test bunit(snap) isa Float64 && bunit(snap) > 0
+
+    # Kernel type stability on Float64 inputs.
+    @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
+end
+
 @testitem "_" begin
     import Aqua
     Aqua.test_all(GRMHDSnapshots; ambiguities=false)

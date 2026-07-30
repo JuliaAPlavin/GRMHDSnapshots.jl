@@ -10,7 +10,9 @@ import Adapt
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
-export KoralSnapshot, load_koral, load_grid, r_min, r_max
+export KoralSnapshot, load_koral, load_grid, r_min, r_max,
+    plasma_state, lapse, lunit, rhounit, bunit,
+    comoving_bsq, comoving_B_gauss, magnetization
 
 struct KoralSnapshot{Ar, Av, Ab, Rp, Tg, T}
     rho::Ar
@@ -246,6 +248,8 @@ Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
     end
     return (_apply_stencil(st, s.rho), _apply_stencil(st, s.velrel), _apply_stencil(st, s.bfield))
 end
+
+include("physics.jl")
 
 Adapt.adapt_structure(to, x::NamedDimsArray) = NamedDimsArray(Adapt.adapt(to, parent(x)), dimnames(x))
 
