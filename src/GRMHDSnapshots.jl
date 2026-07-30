@@ -12,7 +12,7 @@ using Zarr: zopen, ZGroup
 using ZarrZfp
 
 export KoralSnapshot, load_koral, load_grid, r_min, r_max,
-    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, lunit, rhounit, bunit,
+    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
 struct KoralSnapshot{Ar, Av, Ab, Rp, Tg, T}

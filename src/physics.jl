@@ -120,10 +120,22 @@ end
 """
     lapse(r, θ, a)
 
-Gravitational-redshift factor (lapse) α = 1/√(1 + 2r/(r²+a²cos²θ)) at KS `(r, θ)` with spin `a`.
-Type-generic; α → 1 as r → ∞ and α ∈ (0,1] at finite r.
+Normal-(Eulerian-)observer lapse α = 1/√(−gᵗᵗ) = 1/√(1 + 2r/(r²+a²cos²θ)) at KS `(r, θ)` with spin
+`a`: the normal observer's proper-time-per-coordinate-time. NOT the photon redshift — that is
+[`grav_redshift`](@ref) (they differ, even in Schwarzschild). Type-generic; α → 1 as r → ∞, α ∈ (0,1].
 """
 @inline lapse(r, θ, a) = 1/√(1 + 2r/(r^2 + a^2*cos(θ)^2))
+
+"""
+    grav_redshift(r, θ, a)
+
+Gravitational redshift factor g = ν_obs/ν_emit for a static emitter reaching infinity: g = √(−g_tt)
+= √(1 − 2r/(r²+a²cos²θ)) at KS `(r, θ)` with spin `a`. This is *the* gravitational redshift (the
+`k`-direction cancels; Doppler/frame-dragging excluded), coordinate-invariant, → 0 at the horizon.
+Clamped to 0 inside the ergosphere (−g_tt < 0), where no static emitter exists. g → 1 as r → ∞.
+"""
+@inline _grav_redshift(g::SMatrix{4,4}) = (v = -g[1, 1]; √(max(zero(v), v)))   # √(−g_tt), 0 in ergosphere
+@inline grav_redshift(r, θ, a) = _grav_redshift(ks_gcov(r, θ, a))
 
 # ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
 # the downstream synchrotron code, which is plain CGS). ──
@@ -155,12 +167,13 @@ bunit(snap::KoralSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
 """
     map_plasma(f, snap, extras...; threaded=true)
 
-Map a kernel `f(ps, α, extras_cell...)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is
-the [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `α` the lapse — both reconstructed from
-`velrel`/`bfield` and the metric, so `rho` need not be loaded. `extras` are full `(:φ,:θ,:r)`
-`NamedDimsArray`s (e.g. `snap.rho`) whose matching cell is passed after `α`. The Kerr-Schild metric
-(and hence `ps` and `α`) depends only on `(r,θ)`, so it is built once per `(r,θ)` slab and reused
-across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`) or `map`.
+Map a kernel `f(ps, g, extras_cell...)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is
+the [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `g` the per-cell [`grav_redshift`](@ref)
+√(−g_tt) — both reconstructed from `velrel`/`bfield` and the metric, so `rho` need not be loaded.
+`extras` are full `(:φ,:θ,:r)` `NamedDimsArray`s (e.g. `snap.rho`) whose matching cell is passed after
+`g`. The Kerr-Schild metric (and hence `ps` and `g`) depends only on `(r,θ)`, so it is built once per
+`(r,θ)` slab and reused across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`)
+or `map`.
 """
 function map_plasma(f, snap::KoralSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
     rr = 1:size(snap.velrel, :r)
@@ -169,20 +182,20 @@ function map_plasma(f, snap::KoralSnapshot, extras::Vararg{Any,N}; threaded::Boo
     NamedDimsArray(stack(slabs), (:φ, :θ, :r))
 end
 
-# One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and lapse α are built once per θ and reused
-# across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
+# One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and redshift zg are built once per θ and
+# reused across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
 function _plasma_slab(f, snap::KoralSnapshot, extras, i)
     (; velrel, bfield, r_prof, th_grid, spin) = snap
     nφ, nθ = size(velrel, :φ), size(velrel, :θ)
     r = r_prof[i]
-    cell(k, j, g, α) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), α,
-                         map(e -> e[φ=k, θ=j, r=i], extras)...)
+    cell(k, j, g, zg) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), zg,
+                          map(e -> e[φ=k, θ=j, r=i], extras)...)
     g1 = ks_gcov(r, th_grid[i, 1], spin)
-    out = Matrix{typeof(cell(1, 1, g1, 1/√(1 + g1[1, 2])))}(undef, nφ, nθ)
+    out = Matrix{typeof(cell(1, 1, g1, _grav_redshift(g1)))}(undef, nφ, nθ)
     @inbounds for j in 1:nθ
-        g = ks_gcov(r, th_grid[i, j], spin); α = 1/√(1 + g[1, 2])
+        g = ks_gcov(r, th_grid[i, j], spin); zg = _grav_redshift(g)
         for k in 1:nφ
-            out[k, j] = cell(k, j, g, α)
+            out[k, j] = cell(k, j, g, zg)
         end
     end
     out
@@ -193,7 +206,7 @@ end
 
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
-comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, α) -> ps.bsq, snap)
+comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, _) -> ps.bsq, snap)
 
 # Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
 # only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
@@ -248,14 +261,21 @@ Per-cell magnetization σ = b²/ρ [code units], as a `(:φ,:θ,:r)` array. ρ=0
 """
 magnetization(snap::KoralSnapshot) = comoving_bsq(snap) ./ snap.rho
 
+# Replicate a φ-invariant (r,θ) field over φ into a `(:φ,:θ,:r)` array (downstream texture consistency).
+function _phi_replicate(m, nφ)
+    NamedDimsArray([m[i, j] for k in 1:nφ, j in axes(m, 2), i in axes(m, 1)], (:φ, :θ, :r))
+end
+
 """
     lapse(snap)
 
-Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant, replicated for downstream texture consistency).
+Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-function lapse(snap::KoralSnapshot)
-    (; r_prof, th_grid, spin) = snap
-    nφ = size(snap.rho, :φ)
-    α = lapse.(r_prof, th_grid, spin)                     # (r, θ) — φ-invariant, computed once
-    NamedDimsArray([α[i, j] for k in 1:nφ, j in axes(α, 2), i in axes(α, 1)], (:φ, :θ, :r))
-end
+lapse(snap::KoralSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+
+"""
+    grav_redshift(snap)
+
+Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array (φ-invariant).
+"""
+grav_redshift(snap::KoralSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))

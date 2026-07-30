@@ -129,6 +129,14 @@ end
         @test isfinite(α) && 0 < α ≤ 1
     end
 
+    # grav_redshift g = √(−g_tt) = √(1 − 2r/(r²+a²cos²θ)): independently hardcoded, → 1 far away,
+    # → 0 at the horizon, and clamped to 0 inside the ergosphere. NOT equal to the lapse.
+    @test grav_redshift(1e6, 1.0, a) ≈ 1 rtol = 1e-5
+    @test grav_redshift(5.0, π/2, 0.0) ≈ sqrt(1 - 2/5)              # Schwarzschild equator, √0.6
+    @test grav_redshift(2.0, π/2, 0.0) == 0.0                        # Schwarzschild horizon → infinite redshift
+    @test grav_redshift(1.5, π/2, 0.9) == 0.0                        # inside ergosphere (equator, r<2) → clamped
+    @test grav_redshift(5.0, π/2, 0.0) ≠ lapse(5.0, π/2, 0.0)        # distinct from the lapse
+
     # Grid arrays: correct shape/names, finite where ρ>0, kernel-consistent.
     bsqg = comoving_bsq(snap)
     @test dimnames(bsqg) == (:φ, :θ, :r)
@@ -152,8 +160,8 @@ end
     bsq_ref = [plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
                             snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
-    @test map_plasma((ps, α) -> ps.bsq, snap; threaded = true) ==
-          map_plasma((ps, α) -> ps.bsq, snap; threaded = false)
+    @test map_plasma((ps, _) -> ps.bsq, snap; threaded = true) ==
+          map_plasma((ps, _) -> ps.bsq, snap; threaded = false)
     @inferred comoving_bsq(snap)
 
     # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no rho needed (regression:
@@ -165,6 +173,11 @@ end
 
     # lapse(snap) is φ-invariant and equals the scalar lapse at each (r,θ), exactly.
     @test lap == [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+
+    # grav_redshift(snap) is φ-invariant and equals the scalar grav_redshift at each (r,θ), exactly.
+    zg = grav_redshift(snap)
+    @test size(zg) == size(snap.rho) && all(x -> 0 ≤ x ≤ 1, zg)
+    @test zg == [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
     # Unit scalars are positive plain Float64.
     @test lunit(snap) isa Float64 && lunit(snap) > 0
