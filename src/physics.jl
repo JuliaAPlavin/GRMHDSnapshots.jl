@@ -137,6 +137,16 @@ Clamped to 0 inside the ergosphere (−g_tt < 0), where no static emitter exists
 @inline _grav_redshift(g::SMatrix{4,4}) = (v = -g[1, 1]; √(max(zero(v), v)))   # √(−g_tt), 0 in ergosphere
 @inline grav_redshift(r, θ, a) = _grav_redshift(ks_gcov(r, θ, a))
 
+"""
+    volume_ratio(r, θ, a)
+
+Ratio of proper 3-volume to Euclidean coordinate volume at KS `(r, θ)` with spin `a`:
+`√γ/(r²sinθ) = (r²+a²cos²θ)/(r²·α)` (γ the spatial-metric determinant, α the [`lapse`](@ref)).
+Multiplying a per-proper-volume density by this gives a per-displayed-(Cartesian-)volume density, so
+its integral over the drawn `dx dy dz` box is metric-correct. → 1 as r → ∞; > 1 near the BH.
+"""
+@inline volume_ratio(r, θ, a) = (r^2 + a^2*cos(θ)^2)/(r^2*lapse(r, θ, a))
+
 # ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
 # the downstream synchrotron code, which is plain CGS). ──
 
@@ -279,3 +289,10 @@ lapse(snap::KoralSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, sn
 Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array (φ-invariant).
 """
 grav_redshift(snap::KoralSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+
+"""
+    volume_ratio(snap)
+
+Per-cell proper-to-coordinate volume ratio √γ/(r²sinθ), as a `(:φ,:θ,:r)` array (φ-invariant).
+"""
+volume_ratio(snap::KoralSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))

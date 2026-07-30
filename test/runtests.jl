@@ -104,6 +104,7 @@ end
 
 @testitem "plasma physics" begin
     using StaticArrays, Zarr, AxisKeys
+    using LinearAlgebra: det
     using GRMHDSnapshots: plasma_state, ks_gcov
 
     store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
@@ -136,6 +137,16 @@ end
     @test grav_redshift(2.0, π/2, 0.0) == 0.0                        # Schwarzschild horizon → infinite redshift
     @test grav_redshift(1.5, π/2, 0.9) == 0.0                        # inside ergosphere (equator, r<2) → clamped
     @test grav_redshift(5.0, π/2, 0.0) ≠ lapse(5.0, π/2, 0.0)        # distinct from the lapse
+
+    # volume_ratio √γ/(r²sinθ): closed form (r²+a²cos²θ)/(r²α) must equal the numeric spatial-metric
+    # determinant √det(γ)/(r²sinθ); → 1 far away; = 1/α on the equator (ρ²=r² there); ≥ 1.
+    for (r, θ, a) in [(1.3, 0.6, 0.9), (2.0, 1.2, 0.9), (5.0, 2.5, 0.5), (3.0, 0.3, 0.99)]
+        γdet = det(ks_gcov(r, θ, a)[SVector(2, 3, 4), SVector(2, 3, 4)])
+        @test volume_ratio(r, θ, a) ≈ sqrt(γdet)/(r^2*sin(θ)) rtol = 1e-12
+        @test volume_ratio(r, θ, a) ≥ 1
+    end
+    @test volume_ratio(1e6, 1.0, 0.9) ≈ 1 rtol = 1e-5
+    @test volume_ratio(5.0, π/2, 0.9) ≈ 1/lapse(5.0, π/2, 0.9)       # equator: √γ/(r²sinθ) = 1/α
 
     # Grid arrays: correct shape/names, finite where ρ>0, kernel-consistent.
     bsqg = comoving_bsq(snap)
@@ -178,6 +189,11 @@ end
     zg = grav_redshift(snap)
     @test size(zg) == size(snap.rho) && all(x -> 0 ≤ x ≤ 1, zg)
     @test zg == [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+
+    # volume_ratio(snap) is φ-invariant, equals the scalar at each (r,θ), and is ≥ 1 everywhere.
+    vr = volume_ratio(snap)
+    @test size(vr) == size(snap.rho) && all(≥(1), vr)
+    @test vr == [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
     # Unit scalars are positive plain Float64.
     @test lunit(snap) isa Float64 && lunit(snap) > 0
