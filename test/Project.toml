@@ -1,0 +1,8 @@
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+AxisKeys = "94b1ba4f-4ee9-5380-92f1-94cde586c3c5"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
+Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"

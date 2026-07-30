@@ -1,0 +1,1 @@
+{"chunks":[48,32,24],"compressor":{"id":"zfpy","mode":3,"precision":24,"rate":-1,"tolerance":-1},"dimension_separator":".","dtype":"<f4","fill_value":null,"filters":null,"node_type":"array","order":"C","shape":[48,32,24],"zarr_format":2}
