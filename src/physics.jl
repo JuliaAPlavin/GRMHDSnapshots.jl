@@ -177,13 +177,14 @@ bunit(snap::KoralSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
 """
     map_plasma(f, snap, extras...; threaded=true)
 
-Map a kernel `f(ps, g, extras_cell...)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is
-the [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `g` the per-cell [`grav_redshift`](@ref)
-√(−g_tt) — both reconstructed from `velrel`/`bfield` and the metric, so `rho` need not be loaded.
-`extras` are full `(:φ,:θ,:r)` `NamedDimsArray`s (e.g. `snap.rho`) whose matching cell is passed after
-`g`. The Kerr-Schild metric (and hence `ps` and `g`) depends only on `(r,θ)`, so it is built once per
-`(r,θ)` slab and reused across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`)
-or `map`.
+Map a kernel `f(ps, g, cells)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
+[`plasma_state`](@ref) named tuple `(u, b, bsq)` and `g` the per-cell [`grav_redshift`](@ref) √(−g_tt)
+— both reconstructed from `velrel`/`bfield` and the metric, so `rho` need not be loaded. `extras` are
+full `(:φ,:θ,:r)` `NamedDimsArray`s (e.g. `snap.rho`); their matching cells are collected into the
+tuple `cells` passed after `g` (`()` when no extras — passed as one argument, not splatted, so the
+per-cell call stays allocation-free). The Kerr-Schild metric (and hence `ps` and `g`) depends only on
+`(r,θ)`, so it is built once per `(r,θ)` slab and reused across all φ. The outer radial loop runs over
+`OhMyThreads.tmap` (`threaded`) or `map`.
 """
 function map_plasma(f, snap::KoralSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
     rr = 1:size(snap.velrel, :r)
@@ -199,7 +200,7 @@ function _plasma_slab(f, snap::KoralSnapshot, extras, i)
     nφ, nθ = size(velrel, :φ), size(velrel, :θ)
     r = r_prof[i]
     cell(k, j, g, zg) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), zg,
-                          map(e -> e[φ=k, θ=j, r=i], extras)...)
+                          map(e -> @inbounds(e[φ=k, θ=j, r=i]), extras))
     g1 = ks_gcov(r, th_grid[i, 1], spin)
     out = Matrix{typeof(cell(1, 1, g1, _grav_redshift(g1)))}(undef, nφ, nθ)
     @inbounds for j in 1:nθ
@@ -216,7 +217,7 @@ end
 
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
-comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, _) -> ps.bsq, snap)
+comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, _, _) -> ps.bsq, snap)
 
 # Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
 # only `field` (velrel or bfield), so it works on a partially-loaded snapshot.

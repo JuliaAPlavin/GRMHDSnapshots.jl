@@ -171,8 +171,8 @@ end
     bsq_ref = [plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
                             snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
-    @test map_plasma((ps, _) -> ps.bsq, snap; threaded = true) ==
-          map_plasma((ps, _) -> ps.bsq, snap; threaded = false)
+    @test map_plasma((ps, _, _) -> ps.bsq, snap; threaded = true) ==
+          map_plasma((ps, _, _) -> ps.bsq, snap; threaded = false)
     @inferred comoving_bsq(snap)
 
     # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no rho needed (regression:
