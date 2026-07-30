@@ -145,6 +145,20 @@ end
     @test bsqg[φ=k, θ=j, r=i] ≈ plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
                                              snap.r_prof[i], snap.th_grid[i, j], a).bsq
 
+    # map_plasma hoists the (r,θ)-only metric across φ and threads over r: over the whole grid it must
+    # match a naive per-cell reconstruction (independent reference) up to FMA reassociation, and its
+    # result must be bit-identical regardless of thread count.
+    nφ, nθ, nr = size(snap.rho)
+    bsq_ref = [plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
+                            snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    @test bsqg ≈ bsq_ref rtol = 1e-13
+    @test map_plasma((ps, ρ, α) -> ps.bsq, snap; threaded = true) ==
+          map_plasma((ps, ρ, α) -> ps.bsq, snap; threaded = false)
+    @inferred comoving_bsq(snap)
+
+    # lapse(snap) is φ-invariant and equals the scalar lapse at each (r,θ), exactly.
+    @test lap == [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+
     # Unit scalars are positive plain Float64.
     @test lunit(snap) isa Float64 && lunit(snap) > 0
     @test rhounit(snap) isa Float64 && rhounit(snap) > 0

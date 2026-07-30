@@ -22,10 +22,12 @@ end
 end
 
 # Gammie relative-velocity → contravariant 4-velocity u^μ (KS). Uses the closed-form KS inverse-metric
-# row g^{tμ} = (-(1+2r/ρ²), 2r/ρ², 0, 0): only u^t and u^r differ from the relative velocity.
-@inline function gammie_ucon(ũ::SVector{3}, g::SMatrix{4,4}, r, θ, a)
-    tr = 2r/(r^2 + a^2*cos(θ)^2)
-    q = zero(eltype(ũ))
+# row g^{tμ} = (-(1+2r/ρ²), 2r/ρ², 0, 0): only u^t and u^r differ from the relative velocity. `tr = 2r/ρ²`
+# is the metric's (t,r) component `g[1,2]`, reused rather than recomputed. `promote_type` keeps `q` in the
+# metric's precision (a Float32 primitive against a Float64 metric would otherwise box).
+@inline function gammie_ucon(ũ::SVector{3}, g::SMatrix{4,4})
+    tr = g[1, 2]
+    q = zero(promote_type(eltype(ũ), eltype(g)))
     @inbounds for i in 1:3, j in 1:3
         q += g[i+1, j+1]*ũ[i]*ũ[j]
     end
@@ -43,7 +45,7 @@ The spatial part `u^{r,θ,φ}` is the fluid's flow direction; `ũ` itself is mot
 infalling KS normal observer* and points elsewhere near the horizon (its radial component stays
 outward where the fluid is accreting inward).
 """
-@inline fluid_ucon(ũ::SVector{3}, r, θ, a) = gammie_ucon(ũ, ks_gcov(r, θ, a), r, θ, a)
+@inline fluid_ucon(ũ::SVector{3}, r, θ, a) = gammie_ucon(ũ, ks_gcov(r, θ, a))
 
 """
     fluid_velocity(ũ, r, θ, a)
@@ -90,13 +92,15 @@ Named tuple `(u, b, bsq)`:
 - `b::SVector{4}`   — comoving field 4-vector b^μ (orthogonal to u, b·u = 0).
 - `bsq`             — invariant b·b in code units (B²[Gauss] = bsq·bunit²).
 """
-@inline function plasma_state(ũ::SVector{3}, B::SVector{3}, r, θ, a)
-    g = ks_gcov(r, θ, a)
-    u = gammie_ucon(ũ, g, r, θ, a)
+# Core reconstruction given the precomputed metric `g` — lets callers that already hold `g` (e.g. the
+# per-(r,θ) slab in `map_plasma`) skip rebuilding it.
+@inline function _plasma_state(ũ::SVector{3}, B::SVector{3}, g::SMatrix{4,4})
+    u = gammie_ucon(ũ, g)
     ucov = g*u
     b = harm_bcon(B, u, ucov)
     (; u, b, bsq = b'*g*b)
 end
+@inline plasma_state(ũ::SVector{3}, B::SVector{3}, r, θ, a) = _plasma_state(ũ, B, ks_gcov(r, θ, a))
 
 """
     lapse(r, θ, a)
@@ -133,14 +137,38 @@ bunit(snap::KoralSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
 # ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.rho. For cell (φ=k,θ=j,r=i): coords r_prof[i],
 # th_grid[i,j]; primitives velrel/bfield[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
 
-# Map a per-cell kernel of the primitives+coords over the whole grid.
-function _grid_map(f, snap::KoralSnapshot)
-    (; velrel, bfield, r_prof, th_grid, spin) = snap
-    nφ, nθ, nr = size(velrel)
-    NamedDimsArray(
-        [f(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], r_prof[i], th_grid[i, j], spin)
-         for k in 1:nφ, j in 1:nθ, i in 1:nr],
-        (:φ, :θ, :r))
+"""
+    map_plasma(f, snap; threaded=true)
+
+Map a kernel `f(ps, ρ, α)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
+[`plasma_state`](@ref) named tuple `(u, b, bsq)`, `ρ` the density, `α` the lapse. The Kerr-Schild
+metric (and hence `ps`'s reconstruction, plus `α`) depends only on `(r,θ)`, so it is built once per
+`(r,θ)` slab and reused across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`)
+or `map`.
+"""
+function map_plasma(f, snap::KoralSnapshot; threaded::Bool = true)
+    rr = 1:size(snap.rho, :r)
+    slab(i) = _plasma_slab(f, snap, i)              # function barrier → concrete slab element type
+    slabs = threaded ? tmap(slab, rr) : map(slab, rr)
+    NamedDimsArray(stack(slabs), (:φ, :θ, :r))
+end
+
+# One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and lapse α are built once per θ and reused
+# across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
+function _plasma_slab(f, snap::KoralSnapshot, i)
+    (; velrel, bfield, rho, r_prof, th_grid, spin) = snap
+    nφ, nθ = size(rho, :φ), size(rho, :θ)
+    r = r_prof[i]
+    cell(k, j, g, α) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), rho[φ=k, θ=j, r=i], α)
+    g1 = ks_gcov(r, th_grid[i, 1], spin)
+    out = Matrix{typeof(cell(1, 1, g1, 1/√(1 + g1[1, 2])))}(undef, nφ, nθ)
+    @inbounds for j in 1:nθ
+        g = ks_gcov(r, th_grid[i, j], spin); α = 1/√(1 + g[1, 2])
+        for k in 1:nφ
+            out[k, j] = cell(k, j, g, α)
+        end
+    end
+    out
 end
 
 """
@@ -148,9 +176,9 @@ end
 
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
-comoving_bsq(snap::KoralSnapshot) = _grid_map((ũ, B, r, θ, a) -> plasma_state(ũ, B, r, θ, a).bsq, snap)
+comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, ρ, α) -> ps.bsq, snap)
 
-# Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `_grid_map` it touches
+# Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
 # only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
 function _grid_map1(f, field, snap::KoralSnapshot)
     (; r_prof, th_grid, spin) = snap
@@ -203,8 +231,7 @@ Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant, replicated for downs
 """
 function lapse(snap::KoralSnapshot)
     (; r_prof, th_grid, spin) = snap
-    nφ, nθ, nr = size(snap.rho)
-    NamedDimsArray(
-        [lapse(r_prof[i], th_grid[i, j], spin) for k in 1:nφ, j in 1:nθ, i in 1:nr],
-        (:φ, :θ, :r))
+    nφ = size(snap.rho, :φ)
+    α = lapse.(r_prof, th_grid, spin)                     # (r, θ) — φ-invariant, computed once
+    NamedDimsArray([α[i, j] for k in 1:nφ, j in axes(α, 2), i in axes(α, 1)], (:φ, :θ, :r))
 end
