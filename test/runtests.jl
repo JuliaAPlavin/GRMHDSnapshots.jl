@@ -152,9 +152,16 @@ end
     bsq_ref = [plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
                             snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
-    @test map_plasma((ps, ρ, α) -> ps.bsq, snap; threaded = true) ==
-          map_plasma((ps, ρ, α) -> ps.bsq, snap; threaded = false)
+    @test map_plasma((ps, α) -> ps.bsq, snap; threaded = true) ==
+          map_plasma((ps, α) -> ps.bsq, snap; threaded = false)
     @inferred comoving_bsq(snap)
+
+    # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no rho needed (regression:
+    # map_plasma used to index snap.rho for every kernel, crashing on a rho-less snapshot).
+    snap_bv = load_koral(store, "snap002000"; fields = (:velrel, :bfield))
+    @test snap_bv.rho === nothing
+    @test comoving_bsq(snap_bv) == bsqg
+    @test comoving_B_gauss(snap_bv) == comoving_B_gauss(snap)
 
     # lapse(snap) is φ-invariant and equals the scalar lapse at each (r,θ), exactly.
     @test lap == [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]

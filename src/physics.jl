@@ -153,28 +153,30 @@ bunit(snap::KoralSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
 # th_grid[i,j]; primitives velrel/bfield[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
 
 """
-    map_plasma(f, snap; threaded=true)
+    map_plasma(f, snap, extras...; threaded=true)
 
-Map a kernel `f(ps, ρ, α)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
-[`plasma_state`](@ref) named tuple `(u, b, bsq)`, `ρ` the density, `α` the lapse. The Kerr-Schild
-metric (and hence `ps`'s reconstruction, plus `α`) depends only on `(r,θ)`, so it is built once per
-`(r,θ)` slab and reused across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`)
-or `map`.
+Map a kernel `f(ps, α, extras_cell...)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is
+the [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `α` the lapse — both reconstructed from
+`velrel`/`bfield` and the metric, so `rho` need not be loaded. `extras` are full `(:φ,:θ,:r)`
+`NamedDimsArray`s (e.g. `snap.rho`) whose matching cell is passed after `α`. The Kerr-Schild metric
+(and hence `ps` and `α`) depends only on `(r,θ)`, so it is built once per `(r,θ)` slab and reused
+across all φ. The outer radial loop runs over `OhMyThreads.tmap` (`threaded`) or `map`.
 """
-function map_plasma(f, snap::KoralSnapshot; threaded::Bool = true)
-    rr = 1:size(snap.rho, :r)
-    slab(i) = _plasma_slab(f, snap, i)              # function barrier → concrete slab element type
+function map_plasma(f, snap::KoralSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
+    rr = 1:size(snap.velrel, :r)
+    slab(i) = _plasma_slab(f, snap, extras, i)      # function barrier → concrete slab element type
     slabs = threaded ? tmap(slab, rr) : map(slab, rr)
     NamedDimsArray(stack(slabs), (:φ, :θ, :r))
 end
 
 # One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and lapse α are built once per θ and reused
 # across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
-function _plasma_slab(f, snap::KoralSnapshot, i)
-    (; velrel, bfield, rho, r_prof, th_grid, spin) = snap
-    nφ, nθ = size(rho, :φ), size(rho, :θ)
+function _plasma_slab(f, snap::KoralSnapshot, extras, i)
+    (; velrel, bfield, r_prof, th_grid, spin) = snap
+    nφ, nθ = size(velrel, :φ), size(velrel, :θ)
     r = r_prof[i]
-    cell(k, j, g, α) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), rho[φ=k, θ=j, r=i], α)
+    cell(k, j, g, α) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), α,
+                         map(e -> e[φ=k, θ=j, r=i], extras)...)
     g1 = ks_gcov(r, th_grid[i, 1], spin)
     out = Matrix{typeof(cell(1, 1, g1, 1/√(1 + g1[1, 2])))}(undef, nφ, nθ)
     @inbounds for j in 1:nθ
@@ -191,7 +193,7 @@ end
 
 Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
-comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, ρ, α) -> ps.bsq, snap)
+comoving_bsq(snap::KoralSnapshot) = map_plasma((ps, α) -> ps.bsq, snap)
 
 # Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
 # only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
