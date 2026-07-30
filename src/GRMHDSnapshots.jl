@@ -174,26 +174,14 @@ end
     return lo
 end
 
-"""
-    sample(snapshot, x, y, z)
-
-Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
-
-# Arguments
-- `snapshot`: Loaded `KoralSnapshot` with all fluid fields present.
-- `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
-
-# Returns
-- Tuple `(rho, velrel, bfield)`.
-"""
-@inline function sample(s::KoralSnapshot, x, y, z)
-    # Match the interpolation result type.
-    T = promote_type(eltype(s.rho), eltype(s.r_prof)); z3 = zero(SVector{3,T})
+# Trilinear stencil at Cartesian (x,y,z): bracket indices + weights, field-independent.
+# `n3` = φ count (same for every field). Returns `nothing` outside the radial grid.
+@inline function _sample_stencil(s::KoralSnapshot, n3, x, y, z)
     r = sqrt(x^2 + y^2 + z^2)
-    (r < r_min(s) || r > r_max(s)) && return (zero(T), z3, z3)
+    (r < r_min(s) || r > r_max(s)) && return nothing
     θ = acos(clamp(z/r, -one(r), one(r)))
     φ = atan(y, x)
-    n2 = size(s.th_grid, 2); n3 = size(s.rho, :φ)
+    n2 = size(s.th_grid, 2)
 
     i = clamp(bsearchlast(s.r_prof, r), 1, length(s.r_prof) - 1)
     ti = (r - s.r_prof[i])/(s.r_prof[i+1] - s.r_prof[i])
@@ -208,11 +196,55 @@ Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
         (j, clamp((θ - a)/(s.th_grid[ir, j+1] - a), zero(θ), one(θ)))
     end
     ji, tji = θbracket(i); jp, tjp = θbracket(i + 1)
+    return (; i, ti, k, kp, tk, ji, tji, jp, tjp)
+end
 
-    face(A, ir, jj, tj) = @inbounds (A[φ=k, θ=jj, r=ir]*(1-tj) + A[φ=k, θ=jj+1, r=ir]*tj)*(1-tk) +
-                                    (A[φ=kp, θ=jj, r=ir]*(1-tj) + A[φ=kp, θ=jj+1, r=ir]*tj)*tk
-    trilerp(A) = face(A, i, ji, tji)*(1 - ti) + face(A, i + 1, jp, tjp)*ti
-    return (trilerp(s.rho), trilerp(s.velrel), trilerp(s.bfield))
+# Apply a precomputed stencil to a single field array.
+@inline function _apply_stencil(st, A)
+    face(ir, jj, tj) = @inbounds (A[φ=st.k, θ=jj, r=ir]*(1-tj) + A[φ=st.k, θ=jj+1, r=ir]*tj)*(1-st.tk) +
+                                 (A[φ=st.kp, θ=jj, r=ir]*(1-tj) + A[φ=st.kp, θ=jj+1, r=ir]*tj)*st.tk
+    face(st.i, st.ji, st.tji)*(1 - st.ti) + face(st.i + 1, st.jp, st.tjp)*st.ti
+end
+
+"""
+    sample_field(snapshot, field_array, x, y, z)
+
+Interpolate a single fluid field array (e.g. `snap.velrel`) at Cartesian `(x, y, z)`.
+
+# Arguments
+- `snapshot`: Loaded `KoralSnapshot`.
+- `field_array`: One `(φ, θ, r)` field array, e.g. `snap.rho`, `snap.velrel`, or `snap.bfield`.
+- `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
+
+# Returns
+- Interpolated value; `zero(eltype(field_array))` outside the grid.
+"""
+@inline function sample_field(s::KoralSnapshot, A, x, y, z)
+    st = _sample_stencil(s, size(A, :φ), x, y, z)
+    # `* one(weight)` promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
+    st === nothing ? zero(eltype(A)) * one(eltype(s.r_prof)) : _apply_stencil(st, A)
+end
+
+"""
+    sample(snapshot, x, y, z)
+
+Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
+
+# Arguments
+- `snapshot`: Loaded `KoralSnapshot` with all fluid fields present.
+- `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
+
+# Returns
+- Tuple `(rho, velrel, bfield)`.
+"""
+@inline function sample(s::KoralSnapshot, x, y, z)
+    st = _sample_stencil(s, size(s.rho, :φ), x, y, z)
+    if st === nothing
+        # Match the interpolation result type.
+        T = promote_type(eltype(s.rho), eltype(s.r_prof)); z3 = zero(SVector{3,T})
+        return (zero(T), z3, z3)
+    end
+    return (_apply_stencil(st, s.rho), _apply_stencil(st, s.velrel), _apply_stencil(st, s.bfield))
 end
 
 Adapt.adapt_structure(to, x::NamedDimsArray) = NamedDimsArray(Adapt.adapt(to, parent(x)), dimnames(x))

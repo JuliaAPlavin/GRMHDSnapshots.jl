@@ -36,6 +36,17 @@ using TestItemRunner
     snap_rho = load_koral(store, "snap002000"; fields = (:rho,))
     @test snap_rho.velrel === nothing && snap_rho.bfield === nothing
     @test_throws MethodError sample(snap_rho, 5.0, 0.0, 0.0)
+
+    # single-field interpolation: matches the bundled result, needs only its own field
+    using GRMHDSnapshots: sample_field
+    @test @inferred(sample_field(snap, snap.velrel, 5.0, 0.0, 0.0)) == ũ
+    @test @inferred(sample_field(snap, snap.rho, xn, yn, zn)) ≈ snap.rho[φ=k, θ=j, r=i]
+    B0f = @inferred sample_field(snap, snap.bfield, 0.0, 0.0, 10 * r_max(snap))
+    @test B0f isa SVector{3,Float64} && iszero(B0f)
+
+    snap_vel = load_koral(store, "snap002000"; fields = (:velrel,))
+    @test snap_vel.rho === nothing && snap_vel.bfield === nothing
+    @test sample_field(snap_vel, snap_vel.velrel, 5.0, 0.0, 0.0) == ũ   # works with rho/bfield absent
 end
 
 @testitem "extension-sniffing (one-arg zarr snap path)" begin
