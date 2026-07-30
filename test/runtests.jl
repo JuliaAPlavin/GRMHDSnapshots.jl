@@ -208,17 +208,22 @@ end
 
 @testitem "field magnitudes: metric norms, not raw component norms" begin
     using StaticArrays
-    using GRMHDSnapshots: flow_speed, spatial_norm
+    using GRMHDSnapshots: flow_speed, proper_velocity, spatial_norm
 
     # flow_speed = physical v/c relative to the normal observer: 0 at rest, in [0,1), and equal to
     # √(1-1/γ²) with γ derived the INDEPENDENT way from the relative velocity: γ=√(1+|ũ|²_spatial)
     # (HARM identity), not via the reconstruction's u^t path that flow_speed uses internally.
+    # proper_velocity = βγ = √(γ²-1), same γ/frame, unbounded; the HARM identity makes it equal to
+    # |ũ|_spatial exactly, so it's checked the same independent way.
     @test flow_speed(SVector(0.0, 0.0, 0.0), 5.0, 1.0, 0.9) == 0
+    @test proper_velocity(SVector(0.0, 0.0, 0.0), 5.0, 1.0, 0.9) == 0
     for a in (0.0, 0.9), r in (1.3, 3.0, 30.0), θ in (0.3, π/2),
         ũ in (SVector(2.0, -0.05, 1.0), SVector(-1.0, 0.2, 3.0), SVector(0.3, 0.1, -0.2))
         γ = sqrt(1 + spatial_norm(ũ, r, θ, a)^2)
         @test flow_speed(ũ, r, θ, a) ≈ sqrt(1 - 1/γ^2)
         @test 0 ≤ flow_speed(ũ, r, θ, a) < 1
+        @test proper_velocity(ũ, r, θ, a) ≈ sqrt(γ^2 - 1) ≈ spatial_norm(ũ, r, θ, a)
+        @test proper_velocity(ũ, r, θ, a) ≈ flow_speed(ũ, r, θ, a)*γ   # βγ = β·γ
     end
 
     # spatial_norm = √(γᵢⱼVⁱVʲ). Hardcoded against the KS 3-metric written out by hand at one cell:

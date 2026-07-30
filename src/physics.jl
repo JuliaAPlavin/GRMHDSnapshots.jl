@@ -74,6 +74,21 @@ unlike a raw coordinate-component norm. The grid method maps it over a snapshot,
     sqrt(max(zero(γ), 1 - 1/γ^2))
 end
 
+"""
+    proper_velocity(ũ, r, θ, a)
+    proper_velocity(snap)
+
+Proper velocity (celerity) `βγ = √(γ²−1)` of the fluid relative to the local normal (Eulerian)
+observer, `γ = α·uᵗ` the Lorentz factor — the magnitude of the spatial part of the 4-velocity in
+that observer's frame. Same frame as [`flow_speed`](@ref) but unbounded [0,∞): distinguishes highly
+relativistic flows that `v/c` compresses near 1. Computed as `√(γ²−1)` directly (cleaner than `βγ`
+for large γ). The grid method maps it over a snapshot, `(:φ,:θ,:r)`.
+"""
+@inline function proper_velocity(ũ::SVector{3}, r, θ, a)
+    γ = lapse(r, θ, a)*fluid_ucon(ũ, r, θ, a)[1]
+    sqrt(max(zero(γ), γ^2 - 1))
+end
+
 # Lab 3-field B^i + 4-velocity → comoving field 4-vector b^μ (HARM convention b^t = B^i u_i).
 @inline function harm_bcon(B::SVector{3}, u::SVector{4}, ucov::SVector{4})
     b0 = ucov[2]*B[1] + ucov[3]*B[2] + ucov[4]*B[3]
@@ -201,6 +216,13 @@ fluid_velocity(snap::KoralSnapshot) = _grid_map1(fluid_velocity, snap.velrel, sn
 Per-cell physical speed `v/c` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
 flow_speed(snap::KoralSnapshot) = _grid_map1(flow_speed, snap.velrel, snap)
+
+"""
+    proper_velocity(snap)
+
+Per-cell proper velocity `βγ = √(γ²−1)` relative to the normal observer, as a `(:φ,:θ,:r)` array.
+"""
+proper_velocity(snap::KoralSnapshot) = _grid_map1(proper_velocity, snap.velrel, snap)
 
 """
     bfield_magnitude(snap)
