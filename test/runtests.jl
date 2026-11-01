@@ -498,141 +498,6 @@ end
     end
 end
 
-@testitem "H-AMR loader: synthetic round-trip" begin
-    using StaticArrays, NamedDims
-    using GRMHDSnapshots: HAMRCyl, bl_coord, jacobian_spatial, ks_gcov, fluid_ucon
-
-    # A tiny H-AMR dump dir: 2 radial rings × 3 θ rows at φ levels (0, 2, 1) ⇒ 4/16/8 φ cells per row on a
-    # 16-cell finest grid; block ids scrambled and non-contiguous; 4 blocks per new_dump file (last one short).
-    bs = (4, 2, 4); nb = (2, 3, 1); rowlevel = (0, 2, 1)
-    n1, n2, n3 = 8, 6, 16
-    sx = (log(2.5), -1 + 1/6, 0.0); dx = (0.3, (2 - 2/6)/n2, 2π/(nb[3]*bs[3]))
-    a, gam, t, rcyl = 0.8, 13/9, 1234.5, 3.0
-    c = HAMRCyl(startx1 = sx[1], x10 = log(rcyl), x20 = -1 + 1/n2)
-    X1(i) = sx[1] + (i + 1/2)*dx[1]; X2(j) = sx[2] + (j + 1/2)*dx[2]     # 0-based global cells
-    rθ(i, j) = bl_coord(c, X1(i), X2(j))
-
-    blks = [(; level = rowlevel[c2+1], c1, c2, c3) for c1 in 0:nb[1]-1 for c2 in 0:nb[2]-1 for c3 in 0:nb[3]*2^rowlevel[c2+1]-1]
-    nact = length(blks)
-    ids = 3 .* mod.(5 .* (0:nact-1), nact) .+ 1
-    nmax = 3nact + 2
-
-    # Known KS fields at global cell (i, j, coarse φ cell m): ρ, the 4-velocity's spatial part (u^t from
-    # the KS normalization, future root) and the lab field; the dump holds them in native components.
-    ρ(i, j, m) = 1 + i + 10j + 100m
-    uks(i, j, m) = let ui = SVector(-0.1 + 0.01i, 0.002j - 0.005, 0.05 + 0.01m), (r, th) = rθ(i, j), g = ks_gcov(r, th, a)
-        A = g[1, 1]; B = 2*(g[1, 2]*ui[1] + g[1, 3]*ui[2] + g[1, 4]*ui[3]); C = ui'*g[2:4, 2:4]*ui + 1
-        SVector((-B - sqrt(B^2 - 4A*C))/(2A), ui...)
-    end
-    Bks(i, j, m) = SVector(0.5 + 0.1m, -0.1 + 0.01j, 0.2 + 0.001i)
-    # relative velocity via the full inverse metric (independent of the loader's closed form)
-    ũks(i, j, m) = let u = uks(i, j, m), gc = inv(ks_gcov(rθ(i, j)..., a))
-        SVector(u[2] - u[1]*gc[1, 2]/gc[1, 1], u[3] - u[1]*gc[1, 3]/gc[1, 1], u[4] - u[1]*gc[1, 4]/gc[1, 1])
-    end
-    function cellrec(b, ii, jj, kk)
-        i = b.c1*bs[1] + ii; j = b.c2*bs[2] + jj; m = b.c3*bs[3] + kk
-        Ji = inv(jacobian_spatial(c, X1(i), X2(j))); u = uks(i, j, m)
-        SVector{9,Float32}(ρ(i, j, m), 7, u[1], (Ji*u[SVector(2, 3, 4)])..., (Ji*Bks(i, j, m))...)
-    end
-
-    dir = mktempdir()
-    open(joinpath(dir, "parameters"), "w") do io
-        w(xs...) = foreach(x -> write(io, htol(x)), xs)
-        w(t); w(Int32.((nact, nact, 100))...); w(0.0, 0.0, 0.0); w(Int32(1), Int32(1)); w(0.1); w(Int32(0))
-        w(Int32.(bs)...); w(Int32(nmax)); w(Int32.(nb)...)
-        w(sx...); w(dx...); w(2000.0, a, gam, 0.9, exp(sx[1]), exp(sx[1] + n1*dx[1]), 0.0, 1.0)
-        w(zeros(Int32, 15)...)
-        active = zeros(Int32, nmax); active[ids .+ 1] .= 1
-        w(zeros(Int32, nmax)...); w(active...)
-    end
-    open(joinpath(dir, "grid"), "w") do io
-        g = fill(Int32(-1), 36, nmax); g[1, :] .= 0
-        foreach((id, b) -> g[1:6, id+1] = [1, b.level, 0, b.c1, b.c2, b.c3], ids, blks)
-        write(io, htol(Int32(nmax))); write(io, htol.(g))
-    end
-    for (u, part) in enumerate(Iterators.partition(sortperm(ids), 4))
-        open(joinpath(dir, "new_dump$(u-1)"), "w") do io
-            foreach(part) do n
-                cells = [cellrec(blks[n], ii, jj, kk) for kk in 0:bs[3]-1, jj in 0:bs[2]-1, ii in 0:bs[1]-1]
-                write(io, htol.(reinterpret(Float32, vec(cells))))
-            end
-        end
-    end
-    @test length(readdir(dir)) == 2 + 4
-
-    snap = load_hamr(dir; rcyl)
-    @test size(snap.rho) == size(snap.velrel) == size(snap.bfield) == (n3, n2, n1)
-    @test dimnames(snap.rho) == dimnames(snap.velrel) == (:φ, :θ, :r)
-    @test eltype(snap.rho) == Float32 && eltype(snap.velrel) == eltype(snap.bfield) == SVector{3,Float32}
-    @test snap.t == t && snap.spin == a && snap.gam == gam
-    @test snap.φ0 ≈ π/16 && snap.dφ ≈ 2π/16
-    @test snap.M_unit === missing && snap.MBH === missing
-    @test snap.r_prof ≈ exp.(X1.(0:n1-1))
-    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
-    @test [r_min(snap), r_max(snap)] ≈ [exp(X1(0)), exp(X1(n1-1))]
-    @test snap.th_grid ≈ [last(rθ(i, j)) for i in 0:n1-1, j in 0:n2-1]
-
-    # ρ: finest row (θ row 1) copied as-is; coarse rows are periodic piecewise-linear "sawtooths" through the
-    # coarse centers (values 1 + 100m on top of the i, j offset), hardcoded here.
-    saw4 = [113.5; 38.5; 13.5:25:288.5; 263.5; 188.5]    # level 0: 4 coarse cells, s = 4
-    saw2 = [176; 26:50:676; 526]                        # level 1: 8 coarse cells, s = 2
-    for i in 0:n1-1
-        @test snap.rho[θ=1, r=i+1] ≈ saw4 .+ i   && snap.rho[θ=2, r=i+1] ≈ saw4 .+ (i + 10)
-        @test snap.rho[θ=3, r=i+1] == ρ.(i, 2, 0:15) && snap.rho[θ=4, r=i+1] == ρ.(i, 3, 0:15)
-        @test snap.rho[θ=5, r=i+1] ≈ saw2 .+ (i + 40) && snap.rho[θ=6, r=i+1] ≈ saw2 .+ (i + 50)
-    end
-
-    # vectors: B^r is linear in the coarse φ cell, so coarse rows give hardcoded sawtooths as for ρ; ũ is
-    # exact in the finest rows, where the Gammie reconstruction also returns the input 4-velocity; coarse rows
-    # interpolate ũ between coarse centers (hardcoded fine k → (coarse m₀, weight t) pairs).
-    Brow = Dict(1 => 0.5 .+ 0.1 .* (0:15),
-                2 => [0.675; 0.525:0.05:1.175; 1.025],
-                4 => [0.6125; 0.5375; 0.5125:0.025:0.7875; 0.7625; 0.6875])
-    for i in 0:n1-1, j in 0:n2-1
-        Br = Brow[2^(2 - rowlevel[j ÷ 2 + 1])]
-        @test collect(snap.bfield[θ=j+1, r=i+1]) ≈ SVector.(Br, -0.1 + 0.01j, 0.2 + 0.001i) rtol = 1e-6
-    end
-    for i in 0:n1-1, j in 2:3, k in 0:n3-1
-        ũ = snap.velrel[φ=k+1, θ=j+1, r=i+1]
-        @test ũ ≈ ũks(i, j, k) rtol = 1e-5
-        @test fluid_ucon(ũ, rθ(i, j)..., a) ≈ uks(i, j, k) rtol = 1e-5
-    end
-    for i in 0:n1-1, (j, k, m₀, w) in ((0, 2, 0, 0.125), (1, 0, 3, 0.625), (4, 3, 1, 0.25), (5, 15, 7, 0.25))
-        nc = n3 ÷ 2^(2 - rowlevel[j ÷ 2 + 1])
-        @test snap.velrel[φ=k+1, θ=j+1, r=i+1] ≈ (1 - w)*ũks(i, j, m₀) + w*ũks(i, j, mod(m₀ + 1, nc)) rtol = 1e-5
-    end
-
-    # radial subset across a block boundary: global cells 3..5, only rho
-    sub = load_hamr(dir; rcyl, rmin = exp(X1(3)) - 1e-9, rmax = exp(X1(5)) + 1e-9, fields = (:rho,))
-    @test sub.r_prof == snap.r_prof[4:6] && sub.th_grid == snap.th_grid[4:6, :]
-    @test (r_min(sub), r_max(sub)) == (snap.r_prof[4], snap.r_prof[6])
-    @test sub.rho == snap.rho[r=4:6]
-    @test sub.velrel === nothing && sub.bfield === nothing
-    @test load_hamr(dir; rcyl, rmin = exp(X1(6)) - 1e-9).rho == snap.rho[r=7:8]
-
-    # auto-detection; loud failures
-    @test GRMHDSnapshots.snapshot_format(dir) === :hamr
-    @test load_snapshot(dir; rcyl).rho == snap.rho
-    @test_throws UndefKeywordError load_hamr(dir)
-    @test_throws ArgumentError load_hamr(dir; rcyl, rmin = 1e3)
-    @test_throws ArgumentError load_hamr(dir; rcyl, fields = (:rho, :ug))
-    @test_throws ArgumentError load_hamr(dir; rcyl, fields = ())
-    snapb = load_hamr(dir; rcyl, MBH = 6.5e9)                                      # units independently optional
-    @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
-    @test_throws "rhounit needs M_unit" rhounit(snapb)
-    @test load_hamr(dir; rcyl, M_unit = 1e20).M_unit === 1e20
-    bad = mktempdir()
-    foreach(f -> cp(joinpath(dir, f), joinpath(bad, f)), readdir(dir))
-    open(io -> write(io, zeros(UInt8, 4)), joinpath(bad, "new_dump1"), "a")        # not a whole number of blocks
-    @test_throws ArgumentError load_hamr(bad; rcyl)
-    rm(joinpath(bad, "new_dump1")); cp(joinpath(dir, "new_dump1"), joinpath(bad, "new_dump1"))
-    open(io -> write(io, zeros(UInt8, 12)), joinpath(bad, "parameters"), "a")      # newer `parameters` layout
-    @test_throws ArgumentError load_hamr(bad; rcyl)
-    cp(joinpath(dir, "parameters"), joinpath(bad, "parameters"); force = true)
-    open(io -> (seek(io, 100); write(io, htol(-0.9))), joinpath(bad, "parameters"), "r+")   # startx2: asymmetric X2 grid
-    @test_throws ArgumentError load_hamr(bad; rcyl)
-end
-
 @testitem "H-AMR loader: real data (optional, isfile-guarded)" begin
     using StaticArrays, NamedDims
     using GRMHDSnapshots: HAMRCyl, jacobian_spatial, fluid_ucon
@@ -671,12 +536,13 @@ end
             @test u[SVector(2, 3, 4)] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(4, 5, 6)] rtol = 1e-5
             @test snap.bfield[φ=kk+1, θ=j+1, r=i+1] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(7, 8, 9)] rtol = 1e-5
         end
-        # level-0 pole blocks 0 and 31 (COORD3 = 0, 1) = new_dump0 slots 0, 1: 16 fine cells per coarse cell.
-        # Fine k=41 (1-based) lies 1/32 of the way from coarse cell 2 to 3; fine k=1 wraps around φ = 0,
-        # between coarse cell 63 (block 31's last) and 0.
-        for ii in 0:4, jj in (0, 5, 21)
-            @test snap.rho[φ=41, θ=jj+1, r=ii+1] ≈ 31/32*raw(0, 0, ii, jj, 2)[1] + 1/32*raw(0, 0, ii, jj, 3)[1] rtol = 1e-6
-            @test snap.rho[φ=1, θ=jj+1, r=ii+1] ≈ 15/32*raw(0, 1, ii, jj, 31)[1] + 17/32*raw(0, 0, ii, jj, 0)[1] rtol = 1e-6
+        # level-0 pole blocks 0 and 31 (COORD3 = 0, 1) = new_dump0 slots 0, 1: each coarse cell m is copied into the
+        # 16 fine cells it covers, 16m+1 … 16m+16 (1-based).
+        for ii in 0:4, jj in (0, 5, 21), (slot, kk) in ((0, 0), (0, 2), (1, 31))
+            p = raw(0, slot, ii, jj, kk); m = 32*slot + kk
+            @test snap.rho[φ=16m+1:16m+16, θ=jj+1, r=ii+1] == fill(p[1], 16)
+            @test snap.bfield[φ=16m+1:16m+16, θ=jj+1, r=ii+1] == fill(snap.bfield[φ=16m+1, θ=jj+1, r=ii+1], 16)
+            @test snap.bfield[φ=16m+1, θ=jj+1, r=ii+1] ≈ jacobian_spatial(c, X1(ii), X2(jj))*p[SVector(7, 8, 9)] rtol = 1e-5
         end
     else
         @test_skip "H-AMR dump dir absent"
@@ -691,8 +557,9 @@ end
     ids = (109, 188, 390, 547, 3480, 6046, 14742, 17825, 30243, 33426)
     if isfile(joinpath(pdir, "parameters")) && all(id -> isfile(joinpath(gdir, "gdump$id")), ids)
         par = _hamr_parameters(joinpath(pdir, "parameters"))
-        (; blocks, lmax) = _hamr_blocks(pdir, par)
-        @test lmax == 4 && length(blocks) == 14352
+        blocks = _hamr_blocks(pdir, par)
+        lmax = maximum(b -> b.level[3], blocks)
+        @test lmax == 4 && length(blocks) == 14352 && all(b -> b.level[1] == b.level[2] == 0, blocks)
         c = HAMRCyl(startx1 = par.startx[1], x10 = log(24.32), x20 = -1 + 1/1056)
         X1(i) = par.startx[1] + (i + 1/2)*par.dx[1]; X2(j) = par.startx[2] + (j + 1/2)*par.dx[2]
         nc = 9*134*22*32
@@ -701,13 +568,13 @@ end
             # j fastest (gcov, gcon, gdet, dxdxp — each 4×4 row-major)
             a = ltoh.(reinterpret(Float64, read(joinpath(gdir, "gdump$id"), 8*(nc + 49*134*22))))
             cells = reshape(a[1:nc], 9, 32, 22, 134); met = reshape(a[nc+1:end], 49, 22, 134)
-            b = only(filter(b -> b.id == id, blocks)); s = 2^(lmax - b.level)
+            b = only(filter(b -> b.id == id, blocks)); s = 2^(lmax - b.level[3])
             # placement: H-AMR's own global indices and φ centers match the block's grid coordinates
-            @test cells[1, :, :, :] == [b.c1*134 + ii for kk in 1:32, jj in 1:22, ii in 0:133]
-            @test cells[2, :, :, :] == [b.c2*22 + jj for kk in 1:32, jj in 0:21, ii in 1:134]
-            @test cells[9, :, :, :] ≈ [(b.c3*32 + kk + 1/2)*s*2π/1024 for kk in 0:31, jj in 1:22, ii in 1:134] rtol = 1e-14
-            rt = [bl_coord(c, X1(b.c1*134 + ii), X2(b.c2*22 + jj)) for jj in 0:21, ii in 0:133]
-            J  = [jacobian_spatial(c, X1(b.c1*134 + ii), X2(b.c2*22 + jj)) for jj in 0:21, ii in 0:133]
+            @test cells[1, :, :, :] == [b.coord[1]*134 + ii for kk in 1:32, jj in 1:22, ii in 0:133]
+            @test cells[2, :, :, :] == [b.coord[2]*22 + jj for kk in 1:32, jj in 0:21, ii in 1:134]
+            @test cells[9, :, :, :] ≈ [(b.coord[3]*32 + kk + 1/2)*s*2π/1024 for kk in 0:31, jj in 1:22, ii in 1:134] rtol = 1e-14
+            rt = [bl_coord(c, X1(b.coord[1]*134 + ii), X2(b.coord[2]*22 + jj)) for jj in 0:21, ii in 0:133]
+            J  = [jacobian_spatial(c, X1(b.coord[1]*134 + ii), X2(b.coord[2]*22 + jj)) for jj in 0:21, ii in 0:133]
             @test cells[7, 1, :, :] ≈ first.(rt) rtol = 1e-12
             @test maximum(abs, cells[8, 1, :, :] .- last.(rt)) < 1e-12
             # stored dxdxp is finite-differenced (noise ~1e-8): rows r, θ; columns X1, X2
@@ -717,6 +584,108 @@ end
         end
     else
         @test_skip "H-AMR gdump fixtures absent"
+    end
+end
+
+@testitem "H-AMR loader: new layout, real data (optional, isfile-guarded)" begin
+    using StaticArrays, NamedDims, LinearAlgebra
+    using GRMHDSnapshots: ks_gcov, snapshot_format
+
+    # dumps10000 with the run's grid in the sibling `gdumps/` (toolkit layout)
+    dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
+    if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
+        # r ∈ [4, 4.2]: blocks at levels (r, θ, φ) = (1, 1, 1), (1, 1, 0), (0, 0, 1) ⇒ output at level 1 in each direction
+        snap = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2)
+        @test snap.t == 250000.0048901291 && snap.spin == 0.9375
+        @test snap.gam ≈ 13/9 rtol = 1e-15
+        @test size(snap.rho) == size(snap.velrel) == size(snap.bfield) == (192, 192, 3)
+        @test dimnames(snap.rho) == (:φ, :θ, :r)
+        @test eltype(snap.rho) == Float32 && eltype(snap.velrel) == eltype(snap.bfield) == SVector{3,Float32}
+        @test snap.M_unit === missing && snap.MBH === missing
+
+        # level-1 spacings: half the level-0 ones log(Rout/Rin)/420, 2·0.98958…/96, 2π/96
+        h1 = log(1e6/1.2131867454091887)/840; h2 = 2*0.9895833333333334/192
+        X1(i) = 0.19325057145871735 + (i + 1/2)*h1; X2(j) = -0.9895833333333334 + (j + 1/2)*h2
+        @test snap.r_prof ≈ [4.060943340300723, 4.127336454415088, 4.194815041837602] rtol = 1e-14   # level-1 cells 74–76
+        @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
+        @test snap.th_grid ≈ [π/2*(1 + X2(j)) for i in 74:76, j in 0:191] rtol = 1e-14
+        @test snap.th_grid[1, 1] ≈ 0.024458471451287742 rtol = 1e-14
+        @test snap.φ0 ≈ π/192 && snap.dφ ≈ 2π/192
+
+        # Raw cells by independent byte arithmetic, slot 0 of a new_dump file (block → file from the `parameters`
+        # triples, levels/coords from the grid records): 9 float32 per cell, φ fastest, then θ, then r.
+        raw(file, ii, jj, kk) = open(joinpath(dir, "new_dump$file")) do io
+            seek(io, 4*9*((ii*16 + jj)*24 + kk))
+            ltoh.(read!(io, Vector{Float32}(undef, 9)))
+        end
+        J(i, j) = Diagonal(SVector(exp(X1(i)), π/2, 1))
+        # relative velocity via the full inverse metric: ũ^i = u^i − u^t g^{ti}/g^{tt}
+        ũ(i, j, p) = let u = SVector(p[3], (J(i, j)*p[SVector(4, 5, 6)])...), gc = inv(ks_gcov(exp(X1(i)), π/2*(1 + X2(j)), 0.9375))
+            u[SVector(2, 3, 4)] - u[1]*gc[1, SVector(2, 3, 4)]/gc[1, 1]
+        end
+
+        # block 25969 = new_dump6 slot 0, levels (1, 1, 1), COORD (2, 1, 1): its level-1 cells are copied as-is
+        for ii in 4:6, jj in (0, 7, 15), kk in (0, 11, 23)
+            p = raw(6, ii, jj, kk); i, j, k = 70 + ii, 16 + jj, 24 + kk
+            @test snap.rho[φ=k+1, θ=j+1, r=i-73] == p[1]
+            @test snap.velrel[φ=k+1, θ=j+1, r=i-73] ≈ ũ(i, j, p) rtol = 1e-6
+            @test snap.bfield[φ=k+1, θ=j+1, r=i-73] ≈ J(i, j)*p[SVector(7, 8, 9)] rtol = 1e-6
+        end
+        # block 24989 = new_dump8 slot 0, levels (1, 1, 0), COORD (2, 0, 0): each φ cell copied into 2 output cells
+        for ii in 4:6, jj in (0, 9), kk in (0, 23)
+            p = raw(8, ii, jj, kk)
+            @test snap.rho[φ=2kk+1:2kk+2, θ=jj+1, r=ii-3] == [p[1], p[1]]
+            @test snap.bfield[φ=2kk+2, θ=jj+1, r=ii-3] ≈ J(70 + ii, jj)*p[SVector(7, 8, 9)] rtol = 1e-6
+        end
+
+        # caps: an output cell is the mean of the stored cells it covers; the other directions stay at level 1
+        sφ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (φ = 0,))
+        @test size(sφ.rho) == (96, 192, 3) && sφ.φ0 ≈ π/96 && sφ.dφ ≈ 2π/96
+        @test sφ.r_prof == snap.r_prof && sφ.th_grid == snap.th_grid
+        for ii in 4:6, jj in (0, 15), m in (0, 11)
+            p, q = raw(6, ii, jj, 2m), raw(6, ii, jj, 2m + 1); i, j = 70 + ii, 16 + jj
+            @test sφ.rho[φ=12+m+1, θ=j+1, r=i-73] ≈ (p[1] + q[1])/2 rtol = 1e-6
+            @test sφ.velrel[φ=12+m+1, θ=j+1, r=i-73] ≈ (ũ(i, j, p) + ũ(i, j, q))/2 rtol = 1e-6
+            @test sφ.bfield[φ=12+m+1, θ=j+1, r=i-73] ≈ J(i, j)*(p[SVector(7, 8, 9)] + q[SVector(7, 8, 9)])/2 rtol = 1e-6
+        end
+        for ii in 4:6, jj in (0, 9), kk in (0, 23)     # block 24989 is already at φ level 0: copied
+            @test sφ.rho[φ=kk+1, θ=jj+1, r=ii-3] == raw(8, ii, jj, kk)[1]
+        end
+
+        # level-0 radial cell 37 = level-1 cells 74, 75 = block 25969's ii = 4, 5; each stored cell converted at its own r
+        sr = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (r = 0, θ = nothing))
+        @test size(sr.rho) == (192, 192, 1) && sr.dφ == snap.dφ
+        @test sr.r_prof ≈ [4.09400531115158] rtol = 1e-14
+        @test sr.th_grid ≈ snap.th_grid[1:1, :] rtol = 1e-14
+        for jj in (0, 15), kk in (0, 23)
+            p, q = raw(6, 4, jj, kk), raw(6, 5, jj, kk); j, k = 16 + jj, 24 + kk
+            @test sr.rho[φ=k+1, θ=j+1, r=1] ≈ (p[1] + q[1])/2 rtol = 1e-6
+            @test sr.velrel[φ=k+1, θ=j+1, r=1] ≈ (ũ(74, j, p) + ũ(75, j, q))/2 rtol = 1e-6
+            @test sr.bfield[φ=k+1, θ=j+1, r=1] ≈ (J(74, j)*p[SVector(7, 8, 9)] + J(75, j)*q[SVector(7, 8, 9)])/2 rtol = 1e-6
+        end
+
+        # level-0 θ cell m = level-1 cells 2m, 2m+1 = block 25969's jj = 2m-16, 2m-15
+        sθ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:rho,))
+        @test size(sθ.rho) == (192, 96, 3) && sθ.velrel === nothing && sθ.bfield === nothing
+        @test sθ.r_prof == snap.r_prof && sθ.dφ == snap.dφ
+        @test sθ.th_grid ≈ [π/2*(1 - 0.9895833333333334 + (j + 1/2)*2h2) for i in 1:3, j in 0:95] rtol = 1e-14
+        for ii in 4:6, m in (8, 15), kk in (0, 23)
+            @test sθ.rho[φ=24+kk+1, θ=m+1, r=ii-3] ≈ (raw(6, ii, 2m-16, kk)[1] + raw(6, ii, 2m-15, kk)[1])/2 rtol = 1e-6
+        end
+
+        # the output level comes from the blocks whose radial extent overlaps the range: below the edge r = 3.7751… of the
+        # ring with levels up to (1, 1, 1), the inner ring's (0, 0, 1); rmax exactly at the edge already raises it
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.77, fields = (:rho,)).rho) == (192, 96, 1)
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.7751454194494656, fields = (:rho,)).rho) == (192, 192, 3)
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.81, fields = (:rho,)).rho) == (192, 192, 4)
+
+        # auto-detection without any grid argument; units independently optional
+        @test snapshot_format(dir) === :hamr
+        @test load_snapshot(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = (:rho,)).rho == snap.rho
+        snapb = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.1, fields = (:rho,), MBH = 6.5e9)
+        @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
+    else
+        @test_skip "H-AMR new-layout dump dir or gdumps absent"
     end
 end
 

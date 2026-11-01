@@ -117,3 +117,13 @@ end
                dth[1]   dth[2]  z ;
                z        z       o ]
 end
+
+"""
+    HAMRSph()
+
+H-AMR native coordinates without cylindrification: r = exp(X1), θ = π/2·(1 + X2), φ = X3.
+"""
+struct HAMRSph end
+
+@inline bl_coord(::HAMRSph, X1, X2) = (exp(X1), _hamr_th0(X2))
+@inline jacobian_spatial(::HAMRSph, X1, X2) = Diagonal(SVector(exp(X1), π/2, 1))

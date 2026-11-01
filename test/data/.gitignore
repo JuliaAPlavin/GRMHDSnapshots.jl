@@ -1,3 +1,5 @@
 *.h5
 hamr_dumps1000
 hamr_gdumps
+hamr_dumps10000
+gdumps

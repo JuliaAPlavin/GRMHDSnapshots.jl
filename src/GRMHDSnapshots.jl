@@ -2,14 +2,16 @@ module GRMHDSnapshots
 
 using HDF5
 using StaticArrays
+using LinearAlgebra: Diagonal
 using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
-using DataManipulation: mapview, filtermap, flatmap
-using OhMyThreads: tmap, tforeach, @tasks, @local
+using DataManipulation: mapview, filtermap, flatmap, group
+using OhMyThreads: tmap, @tasks, @local, chunks
 import StructArrays
 import ForwardDiff
 import Adapt
+import Mmap
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
@@ -47,7 +49,7 @@ Load a single GRMHD snapshot, auto-detecting the on-disk format:
 - `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref)), read in memory;
 - `.h5` with a `quants/` group → koral ([`load_koral`](@ref)), memory-mapped;
 - a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref));
-- a directory with `parameters`, `grid` and `new_dump0` → H-AMR ([`load_hamr`](@ref); needs its `rcyl` kwarg).
+- a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` kwarg).
 
 Memory-mapping is chosen for the caller: koral `.h5` is mmapped, iharm reads in memory (its
 velocity/field components are reconstructed, not stored, so there is nothing to map). `kwargs...`
@@ -65,12 +67,12 @@ end
     snapshot_format(path) -> Symbol
 
 Detect a snapshot's on-disk format: `:iharm` for an iharm3d/KHARMA `.h5` dump (a `prims` dataset),
-`:hamr` for an H-AMR dump directory (`parameters`, `grid`, `new_dump0`), or `:koral` for the koral
+`:hamr` for an H-AMR dump directory (`parameters`, `new_dump0`), or `:koral` for the koral
 layout (a `.h5` with a `quants/` group, or a Zarr snapshot path).
 """
 function snapshot_format(path::AbstractString)
     p = rstrip(path, '/')
-    all(f -> isfile(joinpath(p, f)), ("parameters", "grid", "new_dump0")) && return :hamr
+    all(f -> isfile(joinpath(p, f)), ("parameters", "new_dump0")) && return :hamr
     endswith(p, ".h5") || return :koral        # Zarr snapshot/run path
     h5open(p, "r") do h5
         haskey(h5, "quants") ? :koral :
@@ -248,89 +250,176 @@ function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_u
 end
 
 """
-    load_hamr(dir; rcyl, rmin=nothing, rmax=nothing, fields=(:rho, :velrel, :bfield), M_unit=missing, MBH=missing)
+    load_hamr(dir; rcyl, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:rho, :velrel, :bfield), M_unit=missing, MBH=missing)
 
-Load an H-AMR native dump directory (`parameters`, `grid`, `new_dump0`, `new_dump1`, …) at native resolution,
-restricted to the radial cells whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range
-are read, and only their radial slabs within it.
+Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …), restricted to the radial cells
+whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range are read, and only their radial slabs within it.
 
-H-AMR refines blocks in φ only, coarser towards the poles. The result is an ordinary uniform
-[`GRMHDSnapshot`] on the finest φ grid: each coarser θ row is upsampled by periodic linear interpolation in
-φ between its coarse cell centers; finest rows are copied as-is.
+Both `parameters` layouts are supported, told apart by the file size: the old one (refinement in φ only, block
+metadata in `dir/grid`) and the new one (refinement in each direction, block metadata in the run's
+`gdumps/grid`, `grid1`, … next to `dir`, i.e. `joinpath(dirname(dir), "gdumps", "grid")`).
 
-The dump stores the 4-velocity `u^μ` and lab field `B^i` in native [`HAMRCyl`](@ref) components; they are
-transformed to Kerr-Schild components via the analytic spatial Jacobian, and `u^μ` is converted to the
-relative velocity `ũ^i`. Fluid arrays are `Float32` (the dump precision); transforms are computed in `Float64`.
+The result is an ordinary uniform [`GRMHDSnapshot`] at one refinement level per direction: the finest level among the
+blocks whose radial extent overlaps `[rmin, rmax]`, capped by `maxlevel`. Each output cell is the average of the
+stored cells it overlaps, weighted by the overlap in native coordinates: a coarser stored cell is copied into every
+output cell it covers, finer ones are averaged. Without caps every output cell is a copy of one stored cell.
+
+The dump stores the 4-velocity `u^μ` and lab field `B^i` in native components; each stored cell is transformed to
+Kerr-Schild components at its own center via the analytic spatial Jacobian, and `u^μ` is converted to the relative
+velocity `ũ^i`, before averaging. Stored values are used without correction, placed at the standard cell centers
+`startx + (i + 1/2)·h` (`i` the 0-based cell index, `h` the cell spacing at the block's level). Fluid arrays are
+`Float32` (the dump precision); transforms and averages are computed in `Float64`.
 
 # Arguments
-- `rcyl`: the run's cylindrification radius (HARMPI `global_x10 = log(rcyl)`; 24.32 for the EHT
-  code-comparison run). Required: it sets θ near the poles but is not stored in the dump files.
-  The other unstored geometry is assumed: cylindrified Gammie θ with hslope = 1, and HARMPI's default
-  corner `x20 = -1 + 1/n2` (`n2` the total θ cell count).
+- `rcyl`: the run's θ coordinates, required since they are not stored in the dump files. A number is the
+  cylindrification radius ([`HAMRCyl`](@ref); HARMPI `global_x10 = log(rcyl)`; 24.32 for the EHT code-comparison
+  run), assuming cylindrified Gammie θ with hslope = 1 and HARMPI's default corner `x20 = -1 + 1/n2` (`n2` the
+  θ cell count); old layout only. `nothing` is plain θ = π/2·(1 + X2) ([`HAMRSph`](@ref)).
 - `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
+- `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
+  each a nonnegative integer, or `nothing` for no cap.
 - `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
 - `M_unit`, `MBH`: physical units (g, M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot`.
 """
-function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing,
+function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
                    fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
     fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
     isempty(fields) && throw(ArgumentError("no fluid fields requested"))
+    keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
+    all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
+        throw(ArgumentError("maxlevel values must be nonnegative integers or nothing, got $maxlevel"))
     par = _hamr_parameters(joinpath(dir, "parameters"))
-    (; blocks, lmax, rowlevel) = _hamr_blocks(dir, par)
+    coords = _hamr_coords(par.layout, rcyl, par)
+    blocks = _hamr_blocks(dir, par)
     (; bs, nb, startx, dx) = par
-    n1, n2, n3 = nb[1]*bs[1], nb[2]*bs[2], nb[3]*bs[3]*2^lmax
-    coords = HAMRCyl(startx1 = startx[1], x10 = log(rcyl), x20 = -1 + 1/n2)
 
-    # zone-centered native coords (Julia index i → 0-based i-1); r = exp(X1) depends on X1 only
-    X1 = startx[1] .+ ((1:n1) .- 1/2) .* dx[1]
-    X2 = startx[2] .+ ((1:n2) .- 1/2) .* dx[2]
-    sel = findall(x -> something(rmin, -Inf) ≤ exp(x) ≤ something(rmax, Inf), X1)
-    isempty(sel) && throw(ArgumentError(
-        "no radial cell centers in [$rmin, $rmax]; the grid spans r = $(exp(first(X1))) … $(exp(last(X1)))"))
-    ir = first(sel):last(sel)
-    r_prof  = exp.(X1[ir])
-    th_grid = [last(bl_coord(coords, x1, x2)) for x1 in X1[ir], x2 in X2]
-    J       = [jacobian_spatial(coords, x1, x2) for x1 in X1[ir], x2 in X2]
+    # output level per direction: the finest among the blocks whose radial extent overlaps the range, capped;
+    # uncapped, the output is then at least as fine as every block holding an output cell
+    rsel = something(rmin, 0)..something(rmax, Inf)
+    nocells() = ArgumentError("no radial cell centers in [$rmin, $rmax]; the grid spans r = $(exp(startx[1])) … $(exp(startx[1] + nb[1]*bs[1]*dx[1]))")
+    redge(b, c) = exp(startx[1] + c*bs[1]*dx[1]/2^b.level[1])
+    near = filter(b -> !isempty((redge(b, b.coord[1])..redge(b, b.coord[1] + 1)) ∩ rsel), blocks)
+    isempty(near) && throw(nocells())
+    finest = ntuple(d -> maximum(b -> b.level[d], near), 3)
+    tl = map((l, k) -> min(something(get(maxlevel, k, nothing), l), l), finest, (:r, :θ, :φ))
+    X(d, i) = _hamr_center(par, d, tl[d], i)
+    n = nb .* bs .* 2 .^ tl
+    # 0-based output radial cells; contiguous since r grows with the index
+    c = filter(i -> exp(X(1, i)) ∈ rsel, 0:n[1]-1)
+    isempty(c) && throw(nocells())
+    ir = first(c):last(c)
 
-    sz = (n3, n2, length(ir))
+    r_prof  = map(i -> exp(X(1, i)), ir)
+    th_grid = [last(bl_coord(coords, X(1, i), X(2, j))) for i in ir, j in 0:n[2]-1]
+
+    sz = (n[3], n[2], length(ir))
     svf() = StructArrays.StructArray{SVector{3,Float32}}(ntuple(_ -> Array{Float32}(undef, sz), 3))
-    rho    = :rho    in fields ? Array{Float32}(undef, sz) : nothing
-    velrel = :velrel in fields ? svf() : nothing
-    bfield = :bfield in fields ? svf() : nothing
-
-    # pass 1: every coarse cell m of a block lands at its first fine φ slot m·s
-    outs = (; rho, velrel, bfield)
-    todo = filter(b -> !isempty(intersect(ir, b.c1*bs[1] .+ (1:bs[1]))), blocks)
-    @tasks for b in todo
-        @local buf = Vector{SVector{9,Float32}}(undef, prod(bs))
-        _hamr_read_block!(outs, buf, b, bs, 2^(lmax - b.level), ir, r_prof, th_grid, J, par.a)
-    end
-    # pass 2: fill the coarse rows in place
-    srow = [2^(lmax - rowlevel[cld(j, bs[2])]) for j in 1:n2]
-    coarse = findall(>(1), srow)
-    comps = (_components(rho)..., _components(velrel)..., _components(bfield)...)
-    tforeach(axes(r_prof, 1)) do i
-        for j in coarse, A in comps
-            _upsample_row!(view(A, :, j, i), srow[j])
-        end
+    outs = (; rho    = :rho    in fields ? Array{Float32}(undef, sz) : nothing,
+              velrel = :velrel in fields ? svf() : nothing,
+              bfield = :bfield in fields ? svf() : nothing)
+    rel = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ ir), blocks)    # every block contributing to the output
+    geo = isnothing(outs.velrel) && isnothing(outs.bfield) ? nothing : _hamr_cell_geometry(rel, par, coords, tl, ir)
+    # Float64 sums for averaged cells; weights add to 1 per output cell since blocks tile, `w > 0` marks them
+    z =(; w = 0.0, rho = isnothing(outs.rho) ? nothing : 0.0,
+           velrel = isnothing(outs.velrel) ? nothing : zero(SVector{3,Float64}),
+           bfield = isnothing(outs.bfield) ? nothing : zero(SVector{3,Float64}))
+    # each task owns whole radial chunks of the output (a few per thread, for balance), so no two tasks write the same cell
+    @tasks for cr in chunks(ir; n = 4Threads.nthreads())
+        @local row = Vector{typeof(z)}(undef, bs[3])
+        cbs = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ cr), rel)
+        ro = first(cr) - first(ir)
+        sums = all(b -> _hamr_iscopy(b, tl), cbs) ? nothing : fill(z, n[3], n[2], length(cr))
+        foreach(b -> _hamr_scatter!(_hamr_iscopy(b, tl) ? outs : sums, ro, row, b, par, geo, tl, cr), cbs)
+        isnothing(sums) || foreach(I -> iszero(sums[I].w) || _hamr_put!(outs, ro, Tuple(I)..., sums[I], 1), CartesianIndices(sums))
     end
 
     nd(A) = isnothing(A) ? nothing : NamedDimsArray(A, (:φ, :θ, :r))
-    dφ = dx[3]/2^lmax
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-    GRMHDSnapshot(nd(rho), nd(velrel), nd(bfield), r_prof, first(r_prof)..last(r_prof), th_grid, startx[3] + dφ/2, dφ,
-        par.a, par.gam, par.t, M_unit, MBH)
+    GRMHDSnapshot(nd(outs.rho), nd(outs.velrel), nd(outs.bfield), r_prof, first(r_prof)..last(r_prof), th_grid,
+        X(3, 0), dx[3]/2^tl[3], par.a, par.gam, par.t, M_unit, MBH)
 end
 
-_components(::Nothing) = ()
-_components(A::Array) = (A,)
-_components(A::StructArrays.StructArray) = Tuple(StructArrays.components(A))
+# One stored cell: rho, ug, u^0..3, B^1..3, little-endian float32.
+const HAMRCell = SVector{9,Float32}
 
-# H-AMR `parameters` (little-endian), old layout: a 264-byte header, then i32[nmax] REFINED and i32[nmax] ACTIVE.
-# The newer layout (active-block triples/pairs after the header) is not supported.
+# Native coordinate in direction d of the center of 0-based cell i at refinement level l.
+_hamr_center(par, d, l, i) = par.startx[d] + (i + 1/2)*par.dx[d]/2^l
+
+# 0-based cells of block `b` in direction d, at its own level.
+_hamr_cells(b, bs, d) = b.coord[d]*bs[d] .+ (0:bs[d]-1)
+
+# 0-based output radial cells, at target levels `tl`, overlapping block `b`.
+_hamr_outcells(b, bs, tl) = _relevel(_hamr_cells(b, bs, 1), tl[1] - b.level[1])
+
+# 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
+_relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
+
+# Spatial Jacobian and KS metric at the stored cell centers, computed once per (r level, θ level, i, j) the blocks need:
+# for each (r level, θ level), the 0-based first cells (i0, j0) and the matrix of (; J, g) from there.
+function _hamr_cell_geometry(blocks, par, coords, tl, ir)
+    span(d, bl) = minimum(b -> first(_hamr_cells(b, par.bs, d)), bl):maximum(b -> last(_hamr_cells(b, par.bs, d)), bl)
+    map(group(b -> b.level[1:2], blocks)) do bl
+        (l1, l2) = first(bl).level
+        ii = _relevel(ir, l1 - tl[1]) ∩ span(1, bl)
+        jj = span(2, bl)
+        M = tmap(CartesianIndices((ii, jj))) do I
+            X1 = _hamr_center(par, 1, l1, I[1]); X2 = _hamr_center(par, 2, l2, I[2])
+            (; J = jacobian_spatial(coords, X1, X2), g = ks_gcov(bl_coord(coords, X1, X2)..., par.a))
+        end
+        (; i0 = first(ii), j0 = first(jj), M)
+    end
+end
+
+# block no finer than the output: each output cell lies in one stored cell, written directly
+_hamr_iscopy(b, tl) = all(≥(0), tl .- b.level)
+
+Base.@propagate_inbounds function _hamr_put!(outs::NamedTuple, ro, ko, jo, it, c, w)
+    isnothing(outs.rho)    || (outs.rho[ko, jo, it + ro] = c.rho)
+    isnothing(outs.velrel) || (outs.velrel[ko, jo, it + ro] = c.velrel)
+    isnothing(outs.bfield) || (outs.bfield[ko, jo, it + ro] = c.bfield)
+end
+Base.@propagate_inbounds _hamr_put!(A::AbstractArray, ro, ko, jo, it, c, w) = A[ko, jo, it] = map((x, y) -> isnothing(x) ? x : x + w*y, A[ko, jo, it], c)
+
+# Put block `b`'s stored cells overlapping the output radial cells `cr` into `sink` (radial index local to `cr`), each
+# converted to KS at its own center and weighted by its overlap. Stored cells: φ fastest, then θ, then r.
+function _hamr_scatter!(sink, ro, row, b, par, geo, tl, cr)
+    (; bs) = par
+    s = tl .- b.level
+    w = exp2(sum(min.(s, 0)))
+    o = b.coord .* bs
+    ii = _relevel(cr, -s[1]) ∩ _hamr_cells(b, bs, 1)
+    cells = view(b.cells, :, :, ii .- (o[1] - 1))
+    G = isnothing(geo) ? nothing : geo[b.level[1:2]]
+    # output φ cells of stored φ cell kl: k0(kl) .+ (1:nk)
+    k0(kl) = first(_relevel((o[3] + kl - 1):(o[3] + kl - 1), s[3]))
+    nk = 1 << max(s[3], 0)
+    for (il, i) in enumerate(ii), jl in 1:bs[2]
+        j = o[2] + jl - 1
+        gc = isnothing(G) ? nothing : G.M[i - G.i0 + 1, j - G.j0 + 1]
+        # convert each stored cell of the φ row once, then put it into every output cell it overlaps
+        map!(kl -> _hamr_ks(ltoh.(cells[kl, jl, il]), gc, eltype(row)), row, 1:bs[3])
+        for it in _relevel(i:i, s[1]) ∩ cr .- (first(cr) - 1), jo in _relevel(j:j, s[2]) .+ 1, kl in 1:bs[3], q in 1:nk
+            @inbounds _hamr_put!(sink, ro, k0(kl) + q, jo, it, row[kl], w)
+        end
+    end
+end
+
+# Stored cell `p` with KS components at its center (geometry `gc`), as the sums element type `E`: unit weight, then the
+# requested fields. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column.
+_hamr_ks(p::HAMRCell, gc, ::Type{E}) where {E} = E((1.0,
+    fieldtype(E, :rho)    === Nothing ? nothing : p[1],
+    fieldtype(E, :velrel) === Nothing ? nothing : gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), gc.g),
+    fieldtype(E, :bfield) === Nothing ? nothing : gc.J*p[SVector(7, 8, 9)]))
+
+struct HAMROldLayout end
+struct HAMRNewLayout end
+
+# H-AMR `parameters` (little-endian): a 264-byte header shared by both layouts, then either (old) i32[nmax] REFINED and
+# i32[nmax] ACTIVE, or (new) an i32 triple (block id, time level, node) per active block in dump order.
+# `dx` is the level-0 cell spacing recomputed from the grid extent, as H-AMR's own readers do.
 function _hamr_parameters(path)
     open(path) do io
         rd(T) = ltoh(read(io, T))
@@ -339,106 +428,124 @@ function _hamr_parameters(path)
         skip(io, 4); n_active_total = rdi(); skip(io, 4)    # n_active, nstep
         skip(io, 3*8 + 2*4 + 8 + 4)                         # Dtd, Dtl, Dtr, dump_cnt, rdump_cnt, dt, failed
         bs = ntuple(_ -> rdi(), 3); nmax = rdi(); nb = ntuple(_ -> rdi(), 3)
-        startx = ntuple(_ -> rd(Float64), 3); dx = ntuple(_ -> rd(Float64), 3)
+        startx = ntuple(_ -> rd(Float64), 3); dxstored = ntuple(_ -> rd(Float64), 3)
         skip(io, 8)                                         # tf
         a = rd(Float64); gam = rd(Float64); skip(io, 8)     # cour
         Rin = rd(Float64); Rout = rd(Float64); R0 = rd(Float64)
         @assert position(io) == 196
 
-        filesize(path) == 264 + 8nmax || throw(ArgumentError(
-            "$path: size $(filesize(path)) ≠ 264 + 8·nmax = $(264 + 8nmax); only the old H-AMR `parameters` layout is supported"))
-        seek(io, 264 + 4nmax)
-        active = ltoh.(read!(io, Vector{Int32}(undef, nmax))) .== 1
-        count(active) == n_active_total || throw(ArgumentError("$path: $(count(active)) ACTIVE blocks ≠ n_active_total = $n_active_total"))
-
-        # the loader assumes r = exp(X1) (R0 = 0) spanning [Rin, Rout], and a full periodic φ circle
+        old = filesize(path) == 264 + 8nmax
+        old || filesize(path) == 264 + 12n_active_total || throw(ArgumentError(
+            "$path: size $(filesize(path)) matches no H-AMR `parameters` layout: old 264 + 8·nmax = $(264 + 8nmax), new 264 + 12·n_active_total = $(264 + 12n_active_total)"))
+        # the loader assumes r = exp(X1) (R0 = 0) starting at Rin, and an equatorially symmetric X2 grid inside [-1, 1]
         R0 == 0 || throw(ArgumentError("$path: R0 = $R0, only R0 = 0 (r = exp(X1)) is supported"))
-        (exp(startx[1]) ≈ Rin && exp(startx[1] + nb[1]*bs[1]*dx[1]) ≈ Rout) ||
-            throw(ArgumentError("$path: grid X1 ∈ [$(startx[1]), +$(nb[1]*bs[1])·$(dx[1])] is inconsistent with r ∈ [$Rin, $Rout]"))
-        nb[3]*bs[3]*dx[3] ≈ 2π || throw(ArgumentError("$path: φ grid spans $(nb[3]*bs[3]*dx[3]) ≠ 2π"))
-        # θ mirroring assumes an equatorially symmetric X2 grid inside [-1, 1]
-        (startx[2] > -1 && startx[2] + nb[2]*bs[2]*dx[2] ≈ -startx[2]) ||
-            throw(ArgumentError("$path: X2 grid [$(startx[2]), +$(nb[2]*bs[2])·$(dx[2])] is not symmetric inside [-1, 1]"))
-        (; t, n_active_total, bs, nb, nmax, startx, dx, a, gam, active)
-    end
-end
+        exp(startx[1]) ≈ Rin || throw(ArgumentError("$path: grid start X1 = $(startx[1]) is inconsistent with Rin = $Rin"))
+        -1 < startx[2] < 0 || throw(ArgumentError("$path: X2 grid start $(startx[2]) is not in (-1, 0)"))
+        dx = ((log(Rout) - log(Rin))/(bs[1]*nb[1]), -2startx[2]/(bs[2]*nb[2]), 2π/(bs[3]*nb[3]))
+        # the new layout stores half the level-0 spacing
+        all(map((s, d) -> s ≈ (old ? d : d/2), dxstored, dx)) ||
+            throw(ArgumentError("$path: stored dx = $dxstored is inconsistent with the grid extent (level-0 spacing $dx)"))
+        common = (; t, bs, nb, nmax, startx, dx, a, gam)
 
-# Active blocks in dump order (ascending `id`) with their file and offset. φ-only refinement: each θ row has one level.
-function _hamr_blocks(dir, par)
-    (; bs, nb, nmax, active, n_active_total) = par
-    gpath = joinpath(dir, "grid")
-    nv = 36                                            # i32 per block: 0 ACTIVE, 1 LEVEL, 2 REFINED, 3-5 COORD1..3, …
-    filesize(gpath) == 4 + 4*nv*nmax || throw(ArgumentError("$gpath: size $(filesize(gpath)) ≠ 4 + 4·$nv·nmax"))
-    grid = open(gpath) do io
-        n = ltoh(read(io, Int32))
-        n == nmax || throw(ArgumentError("$gpath: nmax = $n ≠ $nmax from parameters"))
-        ltoh.(read!(io, Matrix{Int32}(undef, nv, nmax)))
-    end
-    (grid[1, :] .== 1) == active || throw(ArgumentError("$gpath: ACTIVE flags disagree with parameters"))
-    ids = findall(active)
-
-    # dump files new_dump0, new_dump1, …: each holds a whole number of blocks, consecutive in dump order
-    nums = sort(filtermap(f -> (m = match(r"^new_dump(\d+)$", f); isnothing(m) ? nothing : parse(Int, m[1])), readdir(dir)))
-    nums == 0:length(nums) - 1 || throw(ArgumentError("$dir: new_dump files are not numbered 0, 1, … contiguously: $nums"))
-    blockbytes = 9*prod(bs)*sizeof(Float32)
-    locs = flatmap(nums) do u
-        path = joinpath(dir, "new_dump$u")
-        nblk, rem = divrem(filesize(path), blockbytes)
-        rem == 0 || throw(ArgumentError("$path: size $(filesize(path)) is not a multiple of the block size $blockbytes"))
-        map(q -> (file = path, offset = q*blockbytes), 0:nblk-1)
-    end
-    length(locs) == n_active_total || throw(ArgumentError("$dir: new_dump files hold $(length(locs)) blocks ≠ $n_active_total active"))
-
-    blocks = StructArrays.StructArray(map(ids, locs) do n, loc
-        (; id = n - 1, level = Int(grid[2, n]), c1 = Int(grid[4, n]), c2 = Int(grid[5, n]), c3 = Int(grid[6, n]), loc...)
-    end)
-    lmax = maximum(blocks.level)
-    rowlevel = map(0:nb[2]-1) do c2
-        ls = unique(blocks.level[blocks.c2 .== c2])
-        length(ls) == 1 || throw(ArgumentError("$gpath: θ row $c2 has blocks at levels $ls; expected a single level"))
-        only(ls)
-    end
-    all(b -> 0 ≤ b.c1 < nb[1] && 0 ≤ b.c2 < nb[2] && 0 ≤ b.c3 < nb[3]*2^b.level, blocks) && allunique(zip(blocks.c1, blocks.c2, blocks.c3)) &&
-        length(blocks) == nb[1]*sum(l -> nb[3]*2^l, rowlevel) ||
-        throw(ArgumentError("$gpath: active blocks do not tile the grid with φ-only refinement"))
-    (; blocks, lmax, rowlevel)
-end
-
-# Read the radial slab of block `b` overlapping the selected global radial cells `ir`, transform it to KS and
-# store each coarse cell m at fine φ slot m·s. Cells are 9 interleaved float32 (rho, ug, u^0..3, B^1..3), k fastest.
-function _hamr_read_block!(outs, buf, b, bs, s, ir, r_prof, th_grid, J, a)
-    (; rho, velrel, bfield) = outs
-    bs1, bs2, bs3 = bs
-    ii = intersect(ir, b.c1*bs1 .+ (1:bs1))
-    slab = view(buf, 1:length(ii)*bs2*bs3)
-    open(b.file) do io
-        seek(io, b.offset + (first(ii) - b.c1*bs1 - 1)*bs2*bs3*sizeof(eltype(buf)))
-        read!(io, slab)
-    end
-    cells = reshape(slab, bs3, bs2, length(ii))
-    for (il, i) in enumerate(ii), jj in 1:bs2
-        io = i - first(ir) + 1; j = b.c2*bs2 + jj
-        Jc = J[io, j]; g = ks_gcov(r_prof[io], th_grid[io, j], a)
-        for kk in 1:bs3
-            p = ltoh.(cells[kk, jj, il])
-            k = (b.c3*bs3 + kk - 1)*s + 1
-            isnothing(rho)    || (rho[k, j, io] = p[1])
-            # u^t is unchanged: the native↔KS Jacobian has a trivial t row/column
-            isnothing(velrel) || (velrel[k, j, io] = gammie_uprim(SVector(p[3], (Jc*SVector(p[4], p[5], p[6]))...), g))
-            isnothing(bfield) || (bfield[k, j, io] = Jc*SVector(p[7], p[8], p[9]))
+        if old
+            # no physics flags here: the old layout's i32 at byte 256 is something else, e.g. 1, which would read as RAD_M1
+            seek(io, 264 + 4nmax)
+            active = ltoh.(read!(io, Vector{Int32}(undef, nmax))) .== 1
+            count(active) == n_active_total || throw(ArgumentError("$path: $(count(active)) ACTIVE blocks ≠ n_active_total = $n_active_total"))
+            (; common..., layout = HAMROldLayout(), ids = findall(active) .- 1)
+        else
+            # physics flags (RAD_M1, RESISTIVE, …): any set adds per-cell variables, which the loader does not read
+            seek(io, 256); flags = rdi()
+            flags == 0 || throw(ArgumentError("$path: physics flags $flags (extra per-cell variables) are not supported"))
+            seek(io, 264)
+            trip = Int.(ltoh.(read!(io, Matrix{Int32}(undef, 3, n_active_total))))
+            (; common..., layout = HAMRNewLayout(), ids = trip[1, :], nodes = trip[3, :])
         end
     end
 end
 
-# In-place periodic linear upsampling of one φ row whose coarse cells (each spanning `s` fine cells) sit at fine
-# slots 1, 1+s, …: every fine center is interpolated between its two neighbouring coarse centers.
-function _upsample_row!(row::AbstractVector, s::Integer)
-    coarse = row[1:s:end]
-    nc = length(coarse)
-    map!(row, eachindex(row)) do k
-        x = (k - 1/2)/s - 1/2           # fine center k in coarse units: 0-based coarse cell m is centered at x = m
-        m = floor(Int, x); t = x - m
-        (1 - t)*coarse[mod(m, nc) + 1] + t*coarse[mod(m + 1, nc) + 1]
+# Native coordinates from `rcyl`; cylindrification is supported for the old layout only (its corner x20 assumes one θ level).
+_hamr_coords(_, ::Nothing, par) = HAMRSph()
+_hamr_coords(::HAMROldLayout, rcyl::Real, par) = HAMRCyl(startx1 = par.startx[1], x10 = log(rcyl), x20 = -1 + 1/(par.nb[2]*par.bs[2]))
+_hamr_coords(::HAMRNewLayout, rcyl::Real, par) = throw(ArgumentError("rcyl = $rcyl: cylindrified θ is not supported for the new H-AMR layout, pass rcyl = nothing"))
+
+# The numbers N of the files `<prefix>N` in `dir`, sorted.
+function _numbered(dir, prefix)
+    re = Regex("^$prefix(\\d+)\$")
+    sort(filtermap(f -> (m = match(re, f); isnothing(m) ? nothing : parse(Int, m[1])), readdir(dir)))
+end
+
+# Active blocks in dump order: refinement levels and coordinates per direction (r, θ, φ), and stored cells (memory-mapped,
+# indexed φ, θ, r).
+function _hamr_blocks(dir, par)
+    (; bs, nb, ids) = par
+    geom = _hamr_block_geometry(par.layout, dir, par)
+
+    # dump files new_dump0, new_dump1, …: each holds a whole number of blocks, consecutive in dump order
+    nums = _numbered(dir, "new_dump")
+    nums == 0:length(nums) - 1 || throw(ArgumentError("$dir: new_dump files are not numbered 0, 1, … contiguously: $nums"))
+    blockbytes = prod(bs)*sizeof(HAMRCell)
+    locs = flatmap(nums) do u
+        path = joinpath(dir, "new_dump$u")
+        nblk, rem = divrem(filesize(path), blockbytes)
+        rem == 0 || throw(ArgumentError("$path: size $(filesize(path)) is not a multiple of the block size $blockbytes"))
+        cells = Mmap.mmap(path, Array{HAMRCell,4}, (reverse(bs)..., nblk))
+        map(q -> (node = u, cells = view(cells, :, :, :, q)), 1:nblk)
+    end
+    length(locs) == length(ids) || throw(ArgumentError("$dir: new_dump files hold $(length(locs)) blocks ≠ $(length(ids)) active"))
+    _hamr_check_nodes(par.layout, par, locs, dir)
+
+    blocks = StructArrays.StructArray(map((id, g, loc) -> (; id, g.level, g.coord, loc.cells), ids, geom, locs))
+    all(b -> all(d -> b.level[d] ≥ 0 && 0 ≤ b.coord[d] < nb[d]*2^b.level[d], 1:3), blocks) ||
+        throw(ArgumentError("$dir: block coordinates out of range for their refinement levels"))
+    # paint every block onto the finest-level grid, in block units: each slot must be covered exactly once
+    L = ntuple(d -> maximum(b -> b.level[d], blocks), 3)
+    cover = zeros(Int, nb .* 2 .^ L)
+    foreach(b -> cover[ntuple(d -> _relevel(b.coord[d]:b.coord[d], L[d] - b.level[d]) .+ 1, 3)...] .+= 1, blocks)
+    all(isone, cover) || throw(ArgumentError("$dir: active blocks do not tile the grid exactly once"))
+    blocks
+end
+
+# New layout: `parameters` lists each block's node, i.e. its new_dump file.
+_hamr_check_nodes(::HAMROldLayout, par, locs, dir) = nothing
+_hamr_check_nodes(::HAMRNewLayout, par, locs, dir) = par.nodes == map(l -> l.node, locs) ||
+    throw(ArgumentError("$dir: block nodes in `parameters` disagree with the new_dump file sizes"))
+
+# Old layout: metadata in `dir/grid`, 36 i32 per block: 0 ACTIVE, 1 LEVEL, 2 REFINED, 3-5 COORD1..3, …
+function _hamr_block_geometry(::HAMROldLayout, dir, par)
+    gpath = joinpath(dir, "grid")
+    recs = _hamr_grid_records(gpath, par.nmax, par.ids)
+    all(isone, recs[1, :]) || throw(ArgumentError("$gpath: ACTIVE flags disagree with parameters"))
+    map(g -> (level = (0, 0, g[2]), coord = (g[4], g[5], g[6])), eachcol(recs))
+end
+
+# New layout: metadata in the run's `gdumps/grid`, `grid1`, …: i32 3-5 COORD1..3, 110-112 LEVEL1..3 per block.
+# Its ACTIVE flags are those of the time the grid was written, not of this dump.
+function _hamr_block_geometry(::HAMRNewLayout, dir, par)
+    gpath = joinpath(dirname(rstrip(dir, '/')), "gdumps", "grid")
+    recs = _hamr_grid_records(gpath, par.nmax, par.ids)
+    map(g -> (level = (g[111], g[112], g[113]), coord = (g[4], g[5], g[6])), eachcol(recs))
+end
+
+# The records `ids` (0-based) of an H-AMR grid file `gpath`, continued in the parts `gpath1`, `gpath2`, …: an i32 nmax
+# header, then nmax records of nv i32 each, every part holding whole records. Returns the nv × length(ids) Int matrix.
+function _hamr_grid_records(gpath, nmax, ids)
+    isfile(gpath) || throw(ArgumentError("H-AMR grid file $gpath not found"))
+    nums = _numbered(dirname(gpath), basename(gpath))
+    nums == 1:length(nums) || throw(ArgumentError("$gpath: its parts 1, 2, … are not numbered contiguously: $nums"))
+    paths = [gpath; map(u -> "$gpath$u", nums)]
+    head = [4; zeros(Int, length(nums))]                 # bytes before the first record of each part
+    sizes = filesize.(paths) .- head
+    nv, rem = divrem(sum(sizes), 4nmax)
+    rem == 0 || throw(ArgumentError("$gpath: total size $(sum(sizes) + 4) ≠ 4 + 4·nv·nmax for nmax = $nmax"))
+    all(s -> s % 4nv == 0, sizes) || throw(ArgumentError("$gpath: its parts of sizes $sizes do not each hold whole records of $nv i32"))
+    n = open(io -> ltoh(read(io, Int32)), gpath)
+    n == nmax || throw(ArgumentError("$gpath: nmax = $n ≠ $nmax from parameters"))
+    firstid = cumsum([0; sizes[1:end-1] .÷ 4nv])         # first record of each part
+    recs = map((path, h, sz) -> Mmap.mmap(path, Matrix{Int32}, (nv, sz ÷ 4nv), h), paths, head, sizes)
+    stack(ids) do id
+        p = searchsortedlast(firstid, id)
+        Int.(ltoh.(view(recs[p], :, id - firstid[p] + 1)))
     end
 end
 
