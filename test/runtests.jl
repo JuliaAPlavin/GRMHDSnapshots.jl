@@ -423,6 +423,265 @@ end
     end
 end
 
+@testitem "H-AMR cylindrified coordinates" begin
+    using GRMHDSnapshots: HAMRCyl, bl_coord, jacobian_spatial
+
+    # EHT code-comparison run geometry (startx1 from its `parameters`, rcyl = 24.32, 1056 θ cells).
+    c = HAMRCyl(startx1 = 0.19325057145871735, x10 = log(24.32), x20 = -1 + 1/1056)
+
+    # Golden θ and finite-differenced dxdxp written by H-AMR itself into the run's gdump files (blocks 109,
+    # 17825, 547): an independent reference, incl. a strongly cylindrified cell near the pole at small r.
+    for (X1, X2, θ, dθ_dX1, dθ_dX2) in (
+            (0.19512288412257414, -0.9555731318870523, 0.09683481083775666, -0.028480421330300647, 1.5424894932385946),
+            (2.704021853690688,    0.9971608844123048, 3.136200683926511,    0.0024136447729203397, 1.5698613743913405),
+            (0.4572466570625263,  -0.6455553403351699, 0.5705978640536499,  -0.014801254022408136, 1.5493613022014587))
+        r, th = bl_coord(c, X1, X2); J = jacobian_spatial(c, X1, X2)
+        @test r == exp(X1)
+        @test th ≈ θ rtol = 1e-14
+        @test J[2, 1] ≈ dθ_dX1 atol = 1e-7
+        @test J[2, 2] ≈ dθ_dX2 atol = 1e-7
+    end
+    @test !isapprox(last(bl_coord(c, 0.19512288412257414, -0.9555731318870523)), π/2*(1 - 0.9555731318870523); rtol = 0.1)
+
+    # Equatorial symmetry θ(X1, -X2) = π - θ(X1, X2), and plain Gammie θ = π/2·(1+X2) far outside rcyl.
+    for X1 in (0.2, 1.0, 2.5, 3.19, 3.5, 6.0), X2 in (-0.999, -0.99, -0.9, -0.5, -0.1, 0.0)
+        @test last(bl_coord(c, X1, -X2)) ≈ π - last(bl_coord(c, X1, X2)) atol = 1e-14
+    end
+    for X1 in (log(24.32) + 2, 6.2), X2 in (-0.999, -0.5, 0.3, 0.99)
+        @test last(bl_coord(c, X1, X2)) ≈ π/2*(1 + X2) rtol = 1e-14
+    end
+    @test_throws DomainError bl_coord(c, 1.0, 1.2)
+
+    # The AD Jacobian equals the finite-difference derivative of bl_coord; r = exp(X1); φ row/column trivial.
+    h = 1e-6
+    for X1 in (0.2, 1.0, 2.5, 3.19, 4.0), X2 in (-0.995, -0.9, -0.5, 0.2, 0.97)
+        dth_dX1 = (last(bl_coord(c, X1+h, X2)) - last(bl_coord(c, X1-h, X2)))/2h
+        dth_dX2 = (last(bl_coord(c, X1, X2+h)) - last(bl_coord(c, X1, X2-h)))/2h
+        J = @inferred jacobian_spatial(c, X1, X2)
+        @test J[1, 1] ≈ exp(X1)
+        @test J[2, 1] ≈ dth_dX1 atol = 1e-8
+        @test J[2, 2] ≈ dth_dX2 rtol = 1e-8
+        @test J[3, 3] == 1
+        @test J[1, 2] == 0 && J[1, 3] == 0 && J[2, 3] == 0 && J[3, 1] == 0 && J[3, 2] == 0
+    end
+end
+
+@testitem "H-AMR loader: synthetic round-trip" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: HAMRCyl, bl_coord, jacobian_spatial, ks_gcov, fluid_ucon
+
+    # A tiny H-AMR dump dir: 2 radial rings × 3 θ rows at φ levels (0, 2, 1) ⇒ 4/16/8 φ cells per row on a
+    # 16-cell finest grid; block ids scrambled and non-contiguous; 4 blocks per new_dump file (last one short).
+    bs = (4, 2, 4); nb = (2, 3, 1); rowlevel = (0, 2, 1)
+    n1, n2, n3 = 8, 6, 16
+    sx = (log(2.5), -1 + 1/6, 0.0); dx = (0.3, (2 - 2/6)/n2, 2π/(nb[3]*bs[3]))
+    a, gam, t, rcyl = 0.8, 13/9, 1234.5, 3.0
+    c = HAMRCyl(startx1 = sx[1], x10 = log(rcyl), x20 = -1 + 1/n2)
+    X1(i) = sx[1] + (i + 1/2)*dx[1]; X2(j) = sx[2] + (j + 1/2)*dx[2]     # 0-based global cells
+    rθ(i, j) = bl_coord(c, X1(i), X2(j))
+
+    blks = [(; level = rowlevel[c2+1], c1, c2, c3) for c1 in 0:nb[1]-1 for c2 in 0:nb[2]-1 for c3 in 0:nb[3]*2^rowlevel[c2+1]-1]
+    nact = length(blks)
+    ids = 3 .* mod.(5 .* (0:nact-1), nact) .+ 1
+    nmax = 3nact + 2
+
+    # Known KS fields at global cell (i, j, coarse φ cell m): ρ, the 4-velocity's spatial part (u^t from
+    # the KS normalization, future root) and the lab field; the dump holds them in native components.
+    ρ(i, j, m) = 1 + i + 10j + 100m
+    uks(i, j, m) = let ui = SVector(-0.1 + 0.01i, 0.002j - 0.005, 0.05 + 0.01m), (r, th) = rθ(i, j), g = ks_gcov(r, th, a)
+        A = g[1, 1]; B = 2*(g[1, 2]*ui[1] + g[1, 3]*ui[2] + g[1, 4]*ui[3]); C = ui'*g[2:4, 2:4]*ui + 1
+        SVector((-B - sqrt(B^2 - 4A*C))/(2A), ui...)
+    end
+    Bks(i, j, m) = SVector(0.5 + 0.1m, -0.1 + 0.01j, 0.2 + 0.001i)
+    # relative velocity via the full inverse metric (independent of the loader's closed form)
+    ũks(i, j, m) = let u = uks(i, j, m), gc = inv(ks_gcov(rθ(i, j)..., a))
+        SVector(u[2] - u[1]*gc[1, 2]/gc[1, 1], u[3] - u[1]*gc[1, 3]/gc[1, 1], u[4] - u[1]*gc[1, 4]/gc[1, 1])
+    end
+    function cellrec(b, ii, jj, kk)
+        i = b.c1*bs[1] + ii; j = b.c2*bs[2] + jj; m = b.c3*bs[3] + kk
+        Ji = inv(jacobian_spatial(c, X1(i), X2(j))); u = uks(i, j, m)
+        SVector{9,Float32}(ρ(i, j, m), 7, u[1], (Ji*u[SVector(2, 3, 4)])..., (Ji*Bks(i, j, m))...)
+    end
+
+    dir = mktempdir()
+    open(joinpath(dir, "parameters"), "w") do io
+        w(xs...) = foreach(x -> write(io, htol(x)), xs)
+        w(t); w(Int32.((nact, nact, 100))...); w(0.0, 0.0, 0.0); w(Int32(1), Int32(1)); w(0.1); w(Int32(0))
+        w(Int32.(bs)...); w(Int32(nmax)); w(Int32.(nb)...)
+        w(sx...); w(dx...); w(2000.0, a, gam, 0.9, exp(sx[1]), exp(sx[1] + n1*dx[1]), 0.0, 1.0)
+        w(zeros(Int32, 15)...)
+        active = zeros(Int32, nmax); active[ids .+ 1] .= 1
+        w(zeros(Int32, nmax)...); w(active...)
+    end
+    open(joinpath(dir, "grid"), "w") do io
+        g = fill(Int32(-1), 36, nmax); g[1, :] .= 0
+        foreach((id, b) -> g[1:6, id+1] = [1, b.level, 0, b.c1, b.c2, b.c3], ids, blks)
+        write(io, htol(Int32(nmax))); write(io, htol.(g))
+    end
+    for (u, part) in enumerate(Iterators.partition(sortperm(ids), 4))
+        open(joinpath(dir, "new_dump$(u-1)"), "w") do io
+            foreach(part) do n
+                cells = [cellrec(blks[n], ii, jj, kk) for kk in 0:bs[3]-1, jj in 0:bs[2]-1, ii in 0:bs[1]-1]
+                write(io, htol.(reinterpret(Float32, vec(cells))))
+            end
+        end
+    end
+    @test length(readdir(dir)) == 2 + 4
+
+    snap = load_hamr(dir; rcyl)
+    @test size(snap.rho) == size(snap.velrel) == size(snap.bfield) == (n3, n2, n1)
+    @test dimnames(snap.rho) == dimnames(snap.velrel) == (:φ, :θ, :r)
+    @test eltype(snap.rho) == Float32 && eltype(snap.velrel) == eltype(snap.bfield) == SVector{3,Float32}
+    @test snap.t == t && snap.spin == a && snap.gam == gam
+    @test snap.φ0 ≈ π/16 && snap.dφ ≈ 2π/16
+    @test snap.M_unit === missing && snap.MBH === missing
+    @test snap.r_prof ≈ exp.(X1.(0:n1-1))
+    @test snap.th_grid ≈ [last(rθ(i, j)) for i in 0:n1-1, j in 0:n2-1]
+
+    # ρ: finest row (θ row 1) copied as-is; coarse rows are periodic piecewise-linear "sawtooths" through the
+    # coarse centers (values 1 + 100m on top of the i, j offset), hardcoded here.
+    saw4 = [113.5; 38.5; 13.5:25:288.5; 263.5; 188.5]    # level 0: 4 coarse cells, s = 4
+    saw2 = [176; 26:50:676; 526]                        # level 1: 8 coarse cells, s = 2
+    for i in 0:n1-1
+        @test snap.rho[θ=1, r=i+1] ≈ saw4 .+ i   && snap.rho[θ=2, r=i+1] ≈ saw4 .+ (i + 10)
+        @test snap.rho[θ=3, r=i+1] == ρ.(i, 2, 0:15) && snap.rho[θ=4, r=i+1] == ρ.(i, 3, 0:15)
+        @test snap.rho[θ=5, r=i+1] ≈ saw2 .+ (i + 40) && snap.rho[θ=6, r=i+1] ≈ saw2 .+ (i + 50)
+    end
+
+    # vectors: B^r is linear in the coarse φ cell, so coarse rows give hardcoded sawtooths as for ρ; ũ is
+    # exact in the finest rows, where the Gammie reconstruction also returns the input 4-velocity; coarse rows
+    # interpolate ũ between coarse centers (hardcoded fine k → (coarse m₀, weight t) pairs).
+    Brow = Dict(1 => 0.5 .+ 0.1 .* (0:15),
+                2 => [0.675; 0.525:0.05:1.175; 1.025],
+                4 => [0.6125; 0.5375; 0.5125:0.025:0.7875; 0.7625; 0.6875])
+    for i in 0:n1-1, j in 0:n2-1
+        Br = Brow[2^(2 - rowlevel[j ÷ 2 + 1])]
+        @test collect(snap.bfield[θ=j+1, r=i+1]) ≈ SVector.(Br, -0.1 + 0.01j, 0.2 + 0.001i) rtol = 1e-6
+    end
+    for i in 0:n1-1, j in 2:3, k in 0:n3-1
+        ũ = snap.velrel[φ=k+1, θ=j+1, r=i+1]
+        @test ũ ≈ ũks(i, j, k) rtol = 1e-5
+        @test fluid_ucon(ũ, rθ(i, j)..., a) ≈ uks(i, j, k) rtol = 1e-5
+    end
+    for i in 0:n1-1, (j, k, m₀, w) in ((0, 2, 0, 0.125), (1, 0, 3, 0.625), (4, 3, 1, 0.25), (5, 15, 7, 0.25))
+        nc = n3 ÷ 2^(2 - rowlevel[j ÷ 2 + 1])
+        @test snap.velrel[φ=k+1, θ=j+1, r=i+1] ≈ (1 - w)*ũks(i, j, m₀) + w*ũks(i, j, mod(m₀ + 1, nc)) rtol = 1e-5
+    end
+
+    # radial subset across a block boundary: global cells 3..5, only rho
+    sub = load_hamr(dir; rcyl, rmin = exp(X1(3)) - 1e-9, rmax = exp(X1(5)) + 1e-9, fields = (:rho,))
+    @test sub.r_prof == snap.r_prof[4:6] && sub.th_grid == snap.th_grid[4:6, :]
+    @test sub.rho == snap.rho[r=4:6]
+    @test sub.velrel === nothing && sub.bfield === nothing
+    @test load_hamr(dir; rcyl, rmin = exp(X1(6)) - 1e-9).rho == snap.rho[r=7:8]
+
+    # auto-detection; loud failures
+    @test GRMHDSnapshots.snapshot_format(dir) === :hamr
+    @test load_snapshot(dir; rcyl).rho == snap.rho
+    @test_throws UndefKeywordError load_hamr(dir)
+    @test_throws ArgumentError load_hamr(dir; rcyl, rmin = 1e3)
+    @test_throws ArgumentError load_hamr(dir; rcyl, fields = (:rho, :ug))
+    @test_throws ArgumentError load_hamr(dir; rcyl, fields = ())
+    @test_throws ArgumentError load_hamr(dir; rcyl, M_unit = 1e20)
+    bad = mktempdir()
+    foreach(f -> cp(joinpath(dir, f), joinpath(bad, f)), readdir(dir))
+    open(io -> write(io, zeros(UInt8, 4)), joinpath(bad, "new_dump1"), "a")        # not a whole number of blocks
+    @test_throws ArgumentError load_hamr(bad; rcyl)
+    rm(joinpath(bad, "new_dump1")); cp(joinpath(dir, "new_dump1"), joinpath(bad, "new_dump1"))
+    open(io -> write(io, zeros(UInt8, 12)), joinpath(bad, "parameters"), "a")      # newer `parameters` layout
+    @test_throws ArgumentError load_hamr(bad; rcyl)
+    cp(joinpath(dir, "parameters"), joinpath(bad, "parameters"); force = true)
+    open(io -> (seek(io, 100); write(io, htol(-0.9))), joinpath(bad, "parameters"), "r+")   # startx2: asymmetric X2 grid
+    @test_throws ArgumentError load_hamr(bad; rcyl)
+end
+
+@testitem "H-AMR loader: real data (optional, isfile-guarded)" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: HAMRCyl, jacobian_spatial, fluid_ucon
+
+    dir = joinpath(@__DIR__, "data", "hamr_dumps1000")
+    if isfile(joinpath(dir, "parameters"))
+        snap = load_hamr(dir; rcyl = 24.32, rmax = 1.235)      # the innermost 5 radial cells, all fields
+        @test size(snap.rho) == size(snap.velrel) == (1024, 1056, 5)
+        @test snap.t == 5993.937771363162 && snap.spin == 0.9375 && snap.gam == 4/3
+        @test snap.dφ ≈ 2π/1024 && snap.φ0 ≈ π/1024
+        @test snap.r_prof[1] ≈ 1.2154603380902425 rtol = 1e-14         # gdump-stored r, θ of cell (i=0, j=22)
+        @test snap.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
+        @test all(>(0), snap.rho)
+        @test all(v -> all(isfinite, v), snap.velrel) && all(v -> all(isfinite, v), snap.bfield)
+        @test load_snapshot(dir; rcyl = 24.32, rmax = 1.221).rho == snap.rho[r=1:2]
+
+        # Raw cells by independent byte arithmetic: block → (new_dumpN, slot) from the verified block table;
+        # 9 float32 per cell (rho, ug, u^0..3, B^1..3), k fastest, then j, then i.
+        blockbytes = 9*134*22*32*4
+        raw(file, slot, ii, jj, kk) = open(joinpath(dir, "new_dump$file")) do io
+            seek(io, slot*blockbytes + 4*9*((ii*22 + jj)*32 + kk))
+            ltoh.(read!(io, Vector{Float32}(undef, 9)))
+        end
+        c = HAMRCyl(startx1 = 0.19325057145871735, x10 = log(24.32), x20 = -1 + 1/1056)
+        X1(i) = 0.19325057145871735 + (i + 1/2)*0.003744625327713603
+        X2(j) = -0.9981060606060606 + (j + 1/2)*0.0018903523875114783
+
+        # finest-level block 500 (LEVEL 4, COORD = (0, 8, 0)) = new_dump0 slot 86: copied as-is. The loaded ũ
+        # must reproduce the stored u^t (frame-independent here) and J·u^i — a check of J and the metric.
+        for ii in 0:4, jj in (0, 3, 21), kk in (0, 7, 31)
+            p = raw(0, 86, ii, jj, kk)
+            i, j = ii, 8*22 + jj
+            @test snap.rho[φ=kk+1, θ=j+1, r=i+1] == p[1]
+            u = fluid_ucon(snap.velrel[φ=kk+1, θ=j+1, r=i+1], snap.r_prof[i+1], snap.th_grid[i+1, j+1], snap.spin)
+            @test u[1] ≈ p[3] rtol = 1e-5
+            @test u[SVector(2, 3, 4)] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(4, 5, 6)] rtol = 1e-5
+            @test snap.bfield[φ=kk+1, θ=j+1, r=i+1] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(7, 8, 9)] rtol = 1e-5
+        end
+        # level-0 pole blocks 0 and 31 (COORD3 = 0, 1) = new_dump0 slots 0, 1: 16 fine cells per coarse cell.
+        # Fine k=41 (1-based) lies 1/32 of the way from coarse cell 2 to 3; fine k=1 wraps around φ = 0,
+        # between coarse cell 63 (block 31's last) and 0.
+        for ii in 0:4, jj in (0, 5, 21)
+            @test snap.rho[φ=41, θ=jj+1, r=ii+1] ≈ 31/32*raw(0, 0, ii, jj, 2)[1] + 1/32*raw(0, 0, ii, jj, 3)[1] rtol = 1e-6
+            @test snap.rho[φ=1, θ=jj+1, r=ii+1] ≈ 15/32*raw(0, 1, ii, jj, 31)[1] + 17/32*raw(0, 0, ii, jj, 0)[1] rtol = 1e-6
+        end
+    else
+        @test_skip "H-AMR dump dir absent"
+    end
+end
+
+@testitem "H-AMR geometry & block placement vs stored gdumps (optional, isfile-guarded)" begin
+    using GRMHDSnapshots: HAMRCyl, bl_coord, jacobian_spatial, _hamr_parameters, _hamr_blocks
+
+    pdir = joinpath(@__DIR__, "data", "hamr_dumps1000"); gdir = joinpath(@__DIR__, "data", "hamr_gdumps")
+    # levels 0–4, radial rings 0–11, both hemispheres
+    ids = (109, 188, 390, 547, 3480, 6046, 14742, 17825, 30243, 33426)
+    if isfile(joinpath(pdir, "parameters")) && all(id -> isfile(joinpath(gdir, "gdump$id")), ids)
+        par = _hamr_parameters(joinpath(pdir, "parameters"))
+        (; blocks, lmax) = _hamr_blocks(pdir, par)
+        @test lmax == 4 && length(blocks) == 14352
+        c = HAMRCyl(startx1 = par.startx[1], x10 = log(24.32), x20 = -1 + 1/1056)
+        X1(i) = par.startx[1] + (i + 1/2)*par.dx[1]; X2(j) = par.startx[2] + (j + 1/2)*par.dx[2]
+        nc = 9*134*22*32
+        for id in ids
+            # valid prefix: 9 doubles per cell (i, j, k, X1, X2, X3, r, θ, φ), k fastest; then 49 per (i, j),
+            # j fastest (gcov, gcon, gdet, dxdxp — each 4×4 row-major)
+            a = ltoh.(reinterpret(Float64, read(joinpath(gdir, "gdump$id"), 8*(nc + 49*134*22))))
+            cells = reshape(a[1:nc], 9, 32, 22, 134); met = reshape(a[nc+1:end], 49, 22, 134)
+            b = only(filter(b -> b.id == id, blocks)); s = 2^(lmax - b.level)
+            # placement: H-AMR's own global indices and φ centers match the block's grid coordinates
+            @test cells[1, :, :, :] == [b.c1*134 + ii for kk in 1:32, jj in 1:22, ii in 0:133]
+            @test cells[2, :, :, :] == [b.c2*22 + jj for kk in 1:32, jj in 0:21, ii in 1:134]
+            @test cells[9, :, :, :] ≈ [(b.c3*32 + kk + 1/2)*s*2π/1024 for kk in 0:31, jj in 1:22, ii in 1:134] rtol = 1e-14
+            rt = [bl_coord(c, X1(b.c1*134 + ii), X2(b.c2*22 + jj)) for jj in 0:21, ii in 0:133]
+            J  = [jacobian_spatial(c, X1(b.c1*134 + ii), X2(b.c2*22 + jj)) for jj in 0:21, ii in 0:133]
+            @test cells[7, 1, :, :] ≈ first.(rt) rtol = 1e-12
+            @test maximum(abs, cells[8, 1, :, :] .- last.(rt)) < 1e-12
+            # stored dxdxp is finite-differenced (noise ~1e-8): rows r, θ; columns X1, X2
+            @test met[39, :, :] ≈ getindex.(J, 1, 1) rtol = 1e-7
+            @test maximum(abs, met[43, :, :] .- getindex.(J, 2, 1)) < 1e-7
+            @test maximum(abs, met[44, :, :] .- getindex.(J, 2, 2)) < 1e-7
+        end
+    else
+        @test_skip "H-AMR gdump fixtures absent"
+    end
+end
+
 @testitem "_" begin
     import Aqua
     Aqua.test_all(GRMHDSnapshots; ambiguities=false)

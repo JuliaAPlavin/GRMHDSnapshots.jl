@@ -35,6 +35,13 @@ end
     SVector(ufac*(1 + tr), ũ[1] - ufac*tr, ũ[2], ũ[3])
 end
 
+# Inverse of `gammie_ucon`: KS 4-velocity u^μ → relative velocity ũ^i = u^i − u^t g^{ti}/g^{tt}, with the same
+# closed-form g^{tμ} (only ũ^r differs from u^i). Linear in u^μ.
+@inline function gammie_uprim(u::SVector{4}, g::SMatrix{4,4})
+    tr = g[1, 2]
+    SVector(u[2] + u[1]*tr/(1 + tr), u[3], u[4])
+end
+
 """
     fluid_ucon(ũ, r, θ, a)
 

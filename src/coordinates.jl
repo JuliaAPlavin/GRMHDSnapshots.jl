@@ -51,3 +51,69 @@ end
                dth_dX1  dth_dX2  z ;
                z        z        o ]
 end
+
+# H-AMR native coordinates (HARMPI coord.c `vofx_cylindrified`, Gammie hslope = 1): r = exp(X1), φ = X3,
+# θ = π/2·(1 + X2) except the near-pole cells at small r, which are made cylindrical.
+
+"""
+    HAMRCyl(; startx1, x10, x20)
+
+H-AMR cylindrified native-coordinate parameters: grid start `startx1` and the cylindrification corner
+`(x10, x20)` (`x10 = log(rcyl)`). The transition radius `Xtr1` is derived, matching HARMPI.
+"""
+struct HAMRCyl{T}
+    startx1::T
+    x10::T
+    x20::T
+    Xtr1::T
+end
+
+HAMRCyl(; startx1, x10, x20) = HAMRCyl(promote(startx1, x10, x20, log((exp(x10) + exp(startx1))/2))...)
+
+# HARMPI SMALL: regularizes the smooth-max widths.
+const HARMPI_SMALL = 1e-20
+
+# Uncylindrified Gammie colatitude, hslope = 1.
+_hamr_th0(X2) = π/2*(1 + X2)
+
+# HARMPI smooth-ramp helpers (coord.c Fangle/limlin/mins/maxs/minmaxs), same operation order as the C.
+_fangle(x) = x <= -1 ? zero(x) : x >= 1 ? x :
+    (1 + x + (-140*sin((π*(1 + x))/2) + (10*sin((3π*(1 + x))/2))/3 + (2*sin((5π*(1 + x))/2))/5)/(64π))/2
+_mins(f1, f2, df) = f2 - df*_fangle(-(f1 - f2)/df)
+_maxs(f1, f2, df) = -_mins(-f1, -f2, df)
+_minmaxs(f1, f2, df, dir) = dir >= 0 ? _maxs(f1, f2, df) : _mins(f1, f2, df)
+
+# coord.c sinth0 / sinth1in / th2in / func1 / func2, specialized to r = exp(X1), θ = θ₀(X2).
+_sinth0(c::HAMRCyl, X1) = exp(c.x10)*sin(_hamr_th0(c.x20))/exp(X1)
+_sinth1in(c::HAMRCyl, X1, X2) = exp(c.x10)*sin(_hamr_th0(X2))/exp(X1)
+function _th2in(c::HAMRCyl, X1, X2)
+    tc0 = _hamr_th0(c.x20); th0 = asin(_sinth0(c, X1))
+    (_hamr_th0(X2) - tc0)/(π/2 - tc0)*(π/2 - th0) + th0
+end
+_func1(X2) = sin(_hamr_th0(X2))
+_func2(c::HAMRCyl, X1, X2) = _minmaxs(_sinth1in(c, X1, X2), sin(_th2in(c, X1, X2)),
+    abs(sin(_th2in(c, X1, -one(X2))) - _sinth1in(c, X1, -one(X2))) + HARMPI_SMALL, X1 - c.x10)
+
+# coord.c vofx_cylindrified: computed in the X2 ≤ 0 half and mirrored, so θ(X1, -X2) = π - θ(X1, X2).
+function _hamr_theta(c::HAMRCyl, X1, X2in)
+    -1 <= X2in <= 1 || throw(DomainError(X2in, "X2 must lie in [-1, 1]"))
+    mirrored = X2in > 0
+    X2 = mirrored ? -X2in : X2in
+    r = exp(X1)
+    dftr = _func2(c, c.Xtr1, X2) - _func1(X2)
+    th = asin(_maxs(r*_func1(X2), r*_func2(c, X1, X2), exp(c.Xtr1)*abs(dftr) + HARMPI_SMALL)/r)
+    dth = th - _hamr_th0(X2)
+    _hamr_th0(X2in) + (mirrored ? -dth : dth)
+end
+
+@inline bl_coord(c::HAMRCyl, X1, X2) = (exp(X1), _hamr_theta(c, X1, X2))
+
+# Spatial Jacobian J₃ = ∂(r, θ, φ)_KS / ∂(X1, X2, X3), as for FMKS. The θ row is the forward-mode AD derivative
+# of `_hamr_theta` — exact for the same expression, no truncation error; r = exp(X1) and φ = X3 are trivial.
+@inline function jacobian_spatial(c::HAMRCyl, X1, X2)
+    dth = ForwardDiff.gradient(X -> _hamr_theta(c, X[1], X[2]), SVector(X1, X2))
+    o = one(X1); z = zero(X1)
+    @SMatrix [ exp(X1)  z       z ;
+               dth[1]   dth[2]  z ;
+               z        z       o ]
+end
