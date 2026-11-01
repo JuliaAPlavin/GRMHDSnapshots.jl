@@ -668,9 +668,12 @@ end
     (; n, eθ, eφs) = fr
     w = V[2]*eθ + V[3]*eφs
     s2 = n[1]^2 + n[2]^2
-    iszero(s2) && return SVector(V[1], n[3]*copysign(one(s2), n[1])*w[1], zero(s2))
-    is = 1/sqrt(s2)
-    SVector(V[1], (n[3]*(n[1]*w[1] + n[2]*w[2]) - s2*w[3])*is, (n[1]*w[2] - n[2]*w[1])*is^2)
+    # the axis case as selects, not an early return: that branch costs ~8% in GPU ray tracing
+    ax = iszero(s2)
+    is = 1/sqrt(ax ? one(s2) : s2)
+    vθ = ax ? n[3]*copysign(one(s2), n[1])*w[1] : (n[3]*(n[1]*w[1] + n[2]*w[2]) - s2*w[3])*is
+    vφ = ax ? zero(s2) : (n[1]*w[2] - n[2]*w[1])*is^2
+    SVector(V[1], vθ, vφ)
 end
 
 # Geometry `(; r, n, eθ, eφs)` for `_tospin` at the spin-frame point p = R·q, from Cartesian coordinates (no trig: acos
