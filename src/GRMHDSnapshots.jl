@@ -2,7 +2,7 @@ module GRMHDSnapshots
 
 using HDF5
 using StaticArrays
-using LinearAlgebra: Diagonal
+using LinearAlgebra: Diagonal, cross
 using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
@@ -54,7 +54,7 @@ Load a single GRMHD snapshot, auto-detecting the on-disk format:
 - `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref));
 - `.h5` with a `quants/` group → koral ([`load_koral`](@ref));
 - a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref));
-- a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` kwarg).
+- a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` and `spin_axis` kwargs).
 
 `kwargs...` go to the selected loader (e.g. `M_unit`/`MBH` for iharm); use the explicit loaders for full control.
 """
@@ -251,7 +251,7 @@ end
 _cellmap(fs::NamedTuple, n) = [map(f -> f(k, j, i), fs) for k in 1:n[1], j in 1:n[2], i in 1:n[3]]
 
 """
-    load_hamr(dir; rcyl, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
+    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
 
 Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …), restricted to the radial cells
 whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range are read, and only their radial slabs within it.
@@ -267,7 +267,8 @@ output cell it covers, finer ones are averaged. Without caps every output cell i
 
 The dump stores the 4-velocity `u^μ` and lab field `B^i` in native components; each stored cell is transformed to
 Kerr-Schild components at its own center via the analytic spatial Jacobian, and `u^μ` is converted to the relative
-velocity `ũ^i`, before averaging. Stored values are used without correction, placed at the standard cell centers
+velocity `ũ^i` with the Kerr-Schild metric of the spin frame at the cell center's spin-frame colatitude, before
+averaging. Stored values are used without correction, placed at the standard cell centers
 `startx + (i + 1/2)·h` (`i` the 0-based cell index, `h` the cell spacing at the block's level). The `fluid` records are
 `Float32` (the dump precision); transforms and averages are computed in `Float64`.
 
@@ -276,6 +277,9 @@ velocity `ũ^i`, before averaging. Stored values are used without correction, pl
   cylindrification radius ([`HAMRCyl`](@ref); HARMPI `global_x10 = log(rcyl)`; 24.32 for the EHT code-comparison
   run), assuming cylindrified Gammie θ with hslope = 1 and HARMPI's default corner `x20 = -1 + 1/n2` (`n2` the
   θ cell count); old layout only. `nothing` is plain θ = π/2·(1 + X2) ([`HAMRSph`](@ref)).
+- `spin_axis`: the black-hole spin direction in grid Cartesian coordinates, required since the dumps do not store it: one
+  of `(1, 0, 0)`, `(-1, 0, 0)`, `(0, 1, 0)`, `(0, -1, 0)`, `(0, 0, 1)`; e.g. `(0, 0, 1)` for the EHT code-comparison
+  run.
 - `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
 - `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
   each a nonnegative integer, or `nothing` for no cap.
@@ -283,14 +287,15 @@ velocity `ũ^i`, before averaging. Stored values are used without correction, pl
 - `M_unit`, `MBH`: physical units (g, M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
-- `GRMHDSnapshot`.
+- `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.
 """
-function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
+function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
                    fields = (:ρ, :ũ, :B), M_unit = missing, MBH = missing)
     ks = _fluid_keys(fields)
     keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
     all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
         throw(ArgumentError("maxlevel values must be nonnegative integers or nothing, got $maxlevel"))
+    Rv = _hamr_rotation(spin_axis)
     par = _hamr_parameters(joinpath(dir, "parameters"))
     coords = _hamr_coords(par.layout, rcyl, par)
     blocks = _hamr_blocks(dir, par)
@@ -327,13 +332,27 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, ma
         cbs = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ cr), rel)
         ro = first(cr) - first(ir)
         sums = all(b -> _hamr_iscopy(b, tl), cbs) ? nothing : fill(z, n[3], n[2], length(cr))
-        foreach(b -> _hamr_scatter!(_hamr_iscopy(b, tl) ? outs : sums, ro, row, b, par, geo, tl, cr), cbs)
+        foreach(b -> _hamr_scatter!(_hamr_iscopy(b, tl) ? outs : sums, ro, row, b, par, geo, Rv, tl, cr), cbs)
         isnothing(sums) || foreach(I -> iszero(sums[I].w) || _hamr_put!(outs, ro, Tuple(I)..., sums[I], 1), CartesianIndices(sums))
     end
 
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
     GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), r_prof, first(r_prof)..last(r_prof), th_grid,
-        X(3, 0), dx[3]/2^tl[3], Val(one(SMatrix{3,3,Int})), par.a, par.gam, par.t, M_unit, MBH)
+        X(3, 0), dx[3]/2^tl[3], Rv, par.a, par.gam, par.t, M_unit, MBH)
+end
+
+const _HAMR_SPIN_AXES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1))
+
+# `Val` of the smallest rotation taking the grid direction `spin_axis` to +z (Rodrigues, k = a × ẑ), integer for these axes.
+function _hamr_rotation(spin_axis)
+    t = Tuple(spin_axis)
+    t == (0, 0, -1) && throw(ArgumentError(
+        "spin_axis = $spin_axis: no unique smallest rotation takes -z to +z (any half turn about a horizontal axis does)"))
+    t ∈ _HAMR_SPIN_AXES || throw(ArgumentError("spin_axis = $spin_axis: must be one of $(join(_HAMR_SPIN_AXES, ", "))"))
+    a = SVector{3,Int}(t)
+    k = cross(a, SVector(0, 0, 1))
+    K = SMatrix{3,3}(0, k[3], -k[2], -k[3], 0, k[1], k[2], -k[1], 0)
+    Val(one(SMatrix{3,3,Int}) + K + (K*K) .÷ (1 + a[3]))
 end
 
 # One stored cell: rho, ug, u^0..3, B^1..3, little-endian float32.
@@ -351,8 +370,8 @@ _hamr_outcells(b, bs, tl) = _relevel(_hamr_cells(b, bs, 1), tl[1] - b.level[1])
 # 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
 _relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
 
-# Spatial Jacobian and KS metric at the stored cell centers, computed once per (r level, θ level, i, j) the blocks need:
-# for each (r level, θ level), the 0-based first cells (i0, j0) and the matrix of (; J, g) from there.
+# Spatial Jacobian, r and (sin θ, cos θ) at the stored cell centers, computed once per (r level, θ level, i, j) the blocks
+# need: for each (r level, θ level), the 0-based first cells (i0, j0) and the matrix of (; J, r, sθ, cθ) from there.
 function _hamr_cell_geometry(blocks, par, coords, tl, ir)
     span(d, bl) = minimum(b -> first(_hamr_cells(b, par.bs, d)), bl):maximum(b -> last(_hamr_cells(b, par.bs, d)), bl)
     map(group(b -> b.level[1:2], blocks)) do bl
@@ -361,7 +380,9 @@ function _hamr_cell_geometry(blocks, par, coords, tl, ir)
         jj = span(2, bl)
         M = tmap(CartesianIndices((ii, jj))) do I
             X1 = _hamr_center(par, 1, l1, I[1]); X2 = _hamr_center(par, 2, l2, I[2])
-            (; J = jacobian_spatial(coords, X1, X2), g = ks_gcov(bl_coord(coords, X1, X2)..., par.a))
+            r, θ = bl_coord(coords, X1, X2)
+            sθ, cθ = sincos(θ)
+            (; J = jacobian_spatial(coords, X1, X2), r, sθ, cθ)
         end
         (; i0 = first(ii), j0 = first(jj), M)
     end
@@ -376,15 +397,18 @@ Base.@propagate_inbounds _hamr_put!(outs::AbstractArray{R}, ro, ko, jo, it, c, w
 Base.@propagate_inbounds _hamr_put!(sums::AbstractArray{E}, ro, ko, jo, it, c::E, w) where {E} = sums[ko, jo, it] = map((x, y) -> x + w*y, sums[ko, jo, it], c)
 
 # Put block `b`'s stored cells overlapping the output radial cells `cr` into `sink` (radial index local to `cr`), each
-# converted to KS at its own center and weighted by its overlap. Stored cells: φ fastest, then θ, then r.
-function _hamr_scatter!(sink, ro, row, b, par, geo, tl, cr)
+# converted to KS at its own center (spin frame from the rotation `Rv`) and weighted by its overlap. Stored cells: φ
+# fastest, then θ, then r.
+function _hamr_scatter!(sink, ro, row, b, par, geo, Rv, tl, cr)
     (; bs) = par
+    R = _rotation(Rv)
     s = tl .- b.level
     w = exp2(sum(min.(s, 0)))
     o = b.coord .* bs
     ii = _relevel(cr, -s[1]) ∩ _hamr_cells(b, bs, 1)
     cells = view(b.cells, :, :, ii .- (o[1] - 1))
     G = isnothing(geo) ? nothing : geo[b.level[1:2]]
+    φs = map(kl -> sincos(_hamr_center(par, 3, b.level[3], o[3] + kl - 1)), 1:bs[3])
     # output φ cells of stored φ cell kl: k0(kl) .+ (1:nk)
     k0(kl) = first(_relevel((o[3] + kl - 1):(o[3] + kl - 1), s[3]))
     nk = 1 << max(s[3], 0)
@@ -392,19 +416,22 @@ function _hamr_scatter!(sink, ro, row, b, par, geo, tl, cr)
         j = o[2] + jl - 1
         gc = isnothing(G) ? nothing : G.M[i - G.i0 + 1, j - G.j0 + 1]
         # convert each stored cell of the φ row once, then put it into every output cell it overlaps
-        map!(kl -> _hamr_ks(ltoh.(cells[kl, jl, il]), gc, eltype(row)), row, 1:bs[3])
+        map!(kl -> _hamr_ks(ltoh.(cells[kl, jl, il]), gc, φs[kl], R, par.a, eltype(row)), row, 1:bs[3])
         for it in _relevel(i:i, s[1]) ∩ cr .- (first(cr) - 1), jo in _relevel(j:j, s[2]) .+ 1, kl in 1:bs[3], q in 1:nk
             @inbounds _hamr_put!(sink, ro, k0(kl) + q, jo, it, row[kl], w)
         end
     end
 end
 
-# Stored cell `p` with KS components at its center (geometry `gc`), as the sums element type `E`: unit weight `w`, then the
-# requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by the static `K` keeps it
-# type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column.
-function _hamr_ks(p::HAMRCell, gc, ::Type{E}) where {K, E<:NamedTuple{K}}
+# Stored cell `p` with KS components at its center (geometry `gc`, (sin φ, cos φ) of its φ), as the sums element type `E`:
+# unit weight `w`, then the requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by
+# the static `K` keeps it type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column. ũ takes the
+# spin-frame metric at the center's spin-frame direction n.
+function _hamr_ks(p::HAMRCell, gc, (sφ, cφ), R, a, ::Type{E}) where {K, E<:NamedTuple{K}}
     fs = (w = () -> 1.0, ρ = () -> p[1],
-          ũ = () -> gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), gc.g),
+          ũ = () -> let n = R*SVector(gc.sθ*cφ, gc.sθ*sφ, gc.cθ)
+              gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), _ks_gcov_sq(gc.r, n[3]^2, n[1]^2 + n[2]^2, a))
+          end,
           B = () -> gc.J*p[SVector(7, 8, 9)])
     E(map(f -> f(), NamedTuple{K}(fs)))
 end

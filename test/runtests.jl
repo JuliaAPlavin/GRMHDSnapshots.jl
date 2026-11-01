@@ -267,10 +267,10 @@ end
     raw(snap, q) = _apply_stencil(_sample_stencil(snap, size(snap.fluid, :φ), q...), snap.fluid)
 
     koral = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
-    # each snapshot with in-grid radii
+    # each snapshot with in-grid radii; the H-AMR one with spin along grid z, so R is the identity
     dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
     hamr = if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
-        ((load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2), (4.07, 4.13, 4.19)),)
+        ((load_hamr(dir; rcyl = nothing, spin_axis = (0, 0, 1), rmin = 4, rmax = 4.2), (4.07, 4.13, 4.19)),)
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
         ()
@@ -661,13 +661,33 @@ end
     end
 end
 
+@testitem "H-AMR spin axis → rotation" begin
+    using StaticArrays, LinearAlgebra
+    using GRMHDSnapshots: _hamr_rotation, _rotation
+
+    ẑ = SVector(0, 0, 1)
+    for a in (SVector(1, 0, 0), SVector(-1, 0, 0), SVector(0, 1, 0), SVector(0, -1, 0), ẑ)
+        R = _rotation(_hamr_rotation(Tuple(a)))
+        @test _hamr_rotation(a) === _hamr_rotation(Tuple(a))
+        @test R isa SMatrix{3,3,Int}
+        @test R*a == ẑ && R'R == I && det(R) == 1
+        # smallest rotation: about a × ẑ, which it fixes
+        a == ẑ ? (@test R == I) : (@test R*cross(a, ẑ) == cross(a, ẑ))
+    end
+    @test _hamr_rotation((-1, 0, 0)) === Val(SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0))
+    @test_throws "no unique smallest rotation" _hamr_rotation((0, 0, -1))
+    @test_throws ArgumentError _hamr_rotation((1, 1, 0))
+    @test_throws ArgumentError _hamr_rotation((0, 0, 2))
+    @test_throws UndefKeywordError load_hamr(joinpath(@__DIR__, "data", "hamr_dumps10000"); rcyl = nothing)
+end
+
 @testitem "H-AMR loader: real data (optional, isfile-guarded)" begin
     using StaticArrays, NamedDims
     using GRMHDSnapshots: HAMRCyl, jacobian_spatial, fluid_ucon
 
     dir = joinpath(@__DIR__, "data", "hamr_dumps1000")
     if isfile(joinpath(dir, "parameters"))
-        snap = load_hamr(dir; rcyl = 24.32, rmax = 1.235)      # the innermost 5 radial cells, all fields
+        snap = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235)      # the innermost 5 radial cells, all fields
         @test size(snap.fluid) == (1024, 1056, 5)
         @test snap.t == 5993.937771363162 && snap.spin == 0.9375 && snap.gam == 4/3
         @test snap.dφ ≈ 2π/1024 && snap.φ0 ≈ π/1024
@@ -675,9 +695,9 @@ end
         @test snap.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
         @test all(c -> c.ρ > 0, snap.fluid)
         @test all(c -> all(isfinite, c.ũ) && all(isfinite, c.B), snap.fluid)
-        @test load_snapshot(dir; rcyl = 24.32, rmax = 1.221).fluid == snap.fluid[r=1:2]
+        @test load_snapshot(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.221).fluid == snap.fluid[r=1:2]
         # partial: the requested fields in the order (ρ, ũ, B), the same data
-        sp = load_hamr(dir; rcyl = 24.32, rmax = 1.235, fields = (:B, :ρ))
+        sp = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235, fields = (:B, :ρ))
         @test eltype(sp.fluid) == @NamedTuple{ρ::Float32, B::SVector{3,Float32}}
         @test sp.fluid == map(c -> (; c.ρ, c.B), snap.fluid)
 
@@ -755,24 +775,28 @@ end
 end
 
 @testitem "H-AMR loader: new layout, real data (optional, isfile-guarded)" begin
-    using StaticArrays, NamedDims, LinearAlgebra
+    using StaticArrays, NamedDims, LinearAlgebra, ForwardDiff
     using GRMHDSnapshots: ks_gcov, snapshot_format
 
     # dumps10000 with the run's grid in the sibling `gdumps/` (toolkit layout)
     dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
     if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
+        # the run's spin lies along grid −x
+        ld(; kw...) = load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), kw...)
         # r ∈ [4, 4.2]: blocks at levels (r, θ, φ) = (1, 1, 1), (1, 1, 0), (0, 0, 1) ⇒ output at level 1 in each direction
-        snap = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2)
+        snap = ld(rmin = 4, rmax = 4.2)
         @test snap.t == 250000.0048901291 && snap.spin == 0.9375
         @test snap.gam ≈ 13/9 rtol = 1e-15
         @test size(snap.fluid) == (192, 192, 3)
         @test dimnames(snap.fluid) == (:φ, :θ, :r)
         @test parent(snap.fluid) isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
         @test snap.M_unit === missing && snap.MBH === missing
+        R = SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0)
+        @test snap.R === Val(R)
 
         # level-1 spacings: half the level-0 ones log(Rout/Rin)/420, 2·0.98958…/96, 2π/96
         h1 = log(1e6/1.2131867454091887)/840; h2 = 2*0.9895833333333334/192
-        X1(i) = 0.19325057145871735 + (i + 1/2)*h1; X2(j) = -0.9895833333333334 + (j + 1/2)*h2
+        X1(i) = 0.19325057145871735 + (i + 1/2)*h1; X2(j) = -0.9895833333333334 + (j + 1/2)*h2; X3(k) = (k + 1/2)*2π/192
         @test snap.r_prof ≈ [4.060943340300723, 4.127336454415088, 4.194815041837602] rtol = 1e-14   # level-1 cells 74–76
         @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
         @test snap.th_grid ≈ [π/2*(1 + X2(j)) for i in 74:76, j in 0:191] rtol = 1e-14
@@ -786,8 +810,16 @@ end
             ltoh.(read!(io, Vector{Float32}(undef, 9)))
         end
         J(i, j) = Diagonal(SVector(exp(X1(i)), π/2, 1))
-        # relative velocity via the full inverse metric: ũ^i = u^i − u^t g^{ti}/g^{tt}
-        ũ(i, j, p) = let u = SVector(p[3], (J(i, j)*p[SVector(4, 5, 6)])...), gc = inv(ks_gcov(exp(X1(i)), π/2*(1 + X2(j)), 0.9375))
+        # (t, r, θ, φ) → the same point's (t, r, θ, φ) in the frame turned by M
+        turn(M, x) = let c = M*(x[2]*SVector(sin(x[3])*cos(x[4]), sin(x[3])*sin(x[4]), cos(x[3])))
+            SVector(x[1], x[2], acos(c[3]/x[2]), atan(c[2], c[1]))
+        end
+        # relative velocity in grid components via the full inverse metric: the KS one at the spin-frame point, turned to
+        # grid components; ũ^i = u^i − u^t g^{ti}/g^{tt}. (i, j) the stored cell's level-1 indices, φ its center.
+        ũ(i, j, φ, p) = let u = SVector(p[3], (J(i, j)*p[SVector(4, 5, 6)])...),
+                y = turn(R, SVector(0, exp(X1(i)), π/2*(1 + X2(j)), φ)),
+                Λ = ForwardDiff.jacobian(y -> turn(R', y), y),          # ∂(grid)/∂(spin)
+                gc = Λ*inv(ks_gcov(y[2], y[3], 0.9375))*Λ'
             u[SVector(2, 3, 4)] - u[1]*gc[1, SVector(2, 3, 4)]/gc[1, 1]
         end
 
@@ -795,7 +827,7 @@ end
         for ii in 4:6, jj in (0, 7, 15), kk in (0, 11, 23)
             p = raw(6, ii, jj, kk); i, j, k = 70 + ii, 16 + jj, 24 + kk
             @test snap.fluid[φ=k+1, θ=j+1, r=i-73].ρ == p[1]
-            @test snap.fluid[φ=k+1, θ=j+1, r=i-73].ũ ≈ ũ(i, j, p) rtol = 1e-6
+            @test snap.fluid[φ=k+1, θ=j+1, r=i-73].ũ ≈ ũ(i, j, X3(k), p) rtol = 1e-6
             @test snap.fluid[φ=k+1, θ=j+1, r=i-73].B ≈ J(i, j)*p[SVector(7, 8, 9)] rtol = 1e-6
         end
         # block 24989 = new_dump8 slot 0, levels (1, 1, 0), COORD (2, 0, 0): each φ cell copied into 2 output cells
@@ -803,41 +835,68 @@ end
             p = raw(8, ii, jj, kk)
             @test map(c -> c.ρ, snap.fluid[φ=2kk+1:2kk+2, θ=jj+1, r=ii-3]) == [p[1], p[1]]
             @test snap.fluid[φ=2kk+2, θ=jj+1, r=ii-3].B ≈ J(70 + ii, jj)*p[SVector(7, 8, 9)] rtol = 1e-6
+            @test snap.fluid[φ=2kk+2, θ=jj+1, r=ii-3].ũ ≈ ũ(70 + ii, jj, (kk + 1/2)*2π/96, p) rtol = 1e-6   # at its level-0 φ
         end
 
+        # the spin direction: u⁰ rebuilt from the loaded ũ in the spin-frame metric reproduces the stored u⁰ at block 25969's
+        # copied cells (θ rows 16–31), to ~3e-3 since H-AMR's values are not exactly at the cell centers; with the spin
+        # along another axis it does not
+        cells = [(ii, jj, kk) for ii in 4:6, jj in 0:15, kk in 0:23]
+        u0dev(s) = let u0 = map_plasma((ps, _, _) -> ps.u[1], s)
+            maximum(((ii, jj, kk),) -> abs(u0[φ=25+kk, θ=17+jj, r=ii-3]/raw(6, ii, jj, kk)[3] - 1), cells)
+        end
+        @test u0dev(snap) < 1e-2
+        @test all(a -> u0dev(load_hamr(dir; rcyl = nothing, spin_axis = a, rmin = 4, rmax = 4.2)) > 1e-2, ((0, 0, 1), (1, 0, 0)))
+
+        # gas angular momentum L = Σ ρ x × v dV along the spin: x, v spin-frame Cartesian, dV = r² sinθ dr dθ dφ ∝ r³ sinθ
+        # (dr ∝ r, dθ and dφ uniform)
+        sL = ld(rmin = 5, rmax = 15, maxlevel = (r = 0, θ = 0, φ = 0))
+        v = fluid_velocity(sL)
+        L = sum(CartesianIndices(parent(sL.fluid))) do I
+            k, j, i = Tuple(I)
+            r = sL.r_prof[i]; θ = sL.th_grid[i, j]; φ = sL.φ0 + (k - 1)*sL.dφ
+            x = R*(r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)))
+            θ′ = acos(x[3]/r); φ′ = atan(x[2], x[1])
+            vr, vθ, vφ = v[φ=k, θ=j, r=i]
+            vx = vr*SVector(sin(θ′)*cos(φ′), sin(θ′)*sin(φ′), cos(θ′)) + vθ*r*SVector(cos(θ′)*cos(φ′), cos(θ′)*sin(φ′), -sin(θ′)) +
+                 vφ*r*sin(θ′)*SVector(-sin(φ′), cos(φ′), 0)
+            sL.fluid[φ=k, θ=j, r=i].ρ*cross(x, vx)*r^3*sin(θ)
+        end
+        @test acosd(L[3]/norm(L)) < 2
+
         # caps: an output cell is the mean of the stored cells it covers; the other directions stay at level 1
-        sφ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (φ = 0,))
+        sφ = ld(rmin = 4, rmax = 4.2, maxlevel = (φ = 0,))
         @test size(sφ.fluid) == (96, 192, 3) && sφ.φ0 ≈ π/96 && sφ.dφ ≈ 2π/96
         @test sφ.r_prof == snap.r_prof && sφ.th_grid == snap.th_grid
         for ii in 4:6, jj in (0, 15), m in (0, 11)
             p, q = raw(6, ii, jj, 2m), raw(6, ii, jj, 2m + 1); i, j = 70 + ii, 16 + jj
             @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
-            @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ũ ≈ (ũ(i, j, p) + ũ(i, j, q))/2 rtol = 1e-6
+            @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ũ ≈ (ũ(i, j, X3(24 + 2m), p) + ũ(i, j, X3(25 + 2m), q))/2 rtol = 1e-6
             @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].B ≈ J(i, j)*(p[SVector(7, 8, 9)] + q[SVector(7, 8, 9)])/2 rtol = 1e-6
         end
         for ii in 4:6, jj in (0, 9), kk in (0, 23)     # block 24989 is already at φ level 0: copied
             @test sφ.fluid[φ=kk+1, θ=jj+1, r=ii-3].ρ == raw(8, ii, jj, kk)[1]
         end
         # partial, averaged: the requested fields in the order (ρ, ũ, B), the same data
-        sφp = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (φ = 0,), fields = (:B, :ũ))
+        sφp = ld(rmin = 4, rmax = 4.2, maxlevel = (φ = 0,), fields = (:B, :ũ))
         @test eltype(sφp.fluid) == @NamedTuple{ũ::SVector{3,Float32}, B::SVector{3,Float32}}
         @test sφp.fluid == map(c -> (; c.ũ, c.B), sφ.fluid)
-        @test_throws ArgumentError load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = ())
+        @test_throws ArgumentError ld(rmin = 4, rmax = 4.2, fields = ())
 
         # level-0 radial cell 37 = level-1 cells 74, 75 = block 25969's ii = 4, 5; each stored cell converted at its own r
-        sr = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (r = 0, θ = nothing))
+        sr = ld(rmin = 4, rmax = 4.2, maxlevel = (r = 0, θ = nothing))
         @test size(sr.fluid) == (192, 192, 1) && sr.dφ == snap.dφ
         @test sr.r_prof ≈ [4.09400531115158] rtol = 1e-14
         @test sr.th_grid ≈ snap.th_grid[1:1, :] rtol = 1e-14
         for jj in (0, 15), kk in (0, 23)
             p, q = raw(6, 4, jj, kk), raw(6, 5, jj, kk); j, k = 16 + jj, 24 + kk
             @test sr.fluid[φ=k+1, θ=j+1, r=1].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
-            @test sr.fluid[φ=k+1, θ=j+1, r=1].ũ ≈ (ũ(74, j, p) + ũ(75, j, q))/2 rtol = 1e-6
+            @test sr.fluid[φ=k+1, θ=j+1, r=1].ũ ≈ (ũ(74, j, X3(k), p) + ũ(75, j, X3(k), q))/2 rtol = 1e-6
             @test sr.fluid[φ=k+1, θ=j+1, r=1].B ≈ (J(74, j)*p[SVector(7, 8, 9)] + J(75, j)*q[SVector(7, 8, 9)])/2 rtol = 1e-6
         end
 
         # level-0 θ cell m = level-1 cells 2m, 2m+1 = block 25969's jj = 2m-16, 2m-15
-        sθ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:ρ,))
+        sθ = ld(rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:ρ,))
         @test size(sθ.fluid) == (192, 96, 3) && eltype(sθ.fluid) == @NamedTuple{ρ::Float32}
         @test sθ.r_prof == snap.r_prof && sθ.dφ == snap.dφ
         @test sθ.th_grid ≈ [π/2*(1 - 0.9895833333333334 + (j + 1/2)*2h2) for i in 1:3, j in 0:95] rtol = 1e-14
@@ -847,14 +906,14 @@ end
 
         # the output level comes from the blocks whose radial extent overlaps the range: below the edge r = 3.7751… of the
         # ring with levels up to (1, 1, 1), the inner ring's (0, 0, 1); rmax exactly at the edge already raises it
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.77, fields = (:ρ,)).fluid) == (192, 96, 1)
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.7751454194494656, fields = (:ρ,)).fluid) == (192, 192, 3)
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.81, fields = (:ρ,)).fluid) == (192, 192, 4)
+        @test size(ld(rmin = 3.6, rmax = 3.77, fields = (:ρ,)).fluid) == (192, 96, 1)
+        @test size(ld(rmin = 3.6, rmax = 3.7751454194494656, fields = (:ρ,)).fluid) == (192, 192, 3)
+        @test size(ld(rmin = 3.6, rmax = 3.81, fields = (:ρ,)).fluid) == (192, 192, 4)
 
         # auto-detection without any grid argument; units independently optional
         @test snapshot_format(dir) === :hamr
-        @test load_snapshot(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid == map(c -> (; c.ρ), snap.fluid)
-        snapb = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
+        @test load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid == map(c -> (; c.ρ), snap.fluid)
+        snapb = ld(rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
         @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
