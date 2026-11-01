@@ -29,13 +29,16 @@ include("coordinates.jl")
 # `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
 # (lab field B^i), vectors in Kerr-Schild components; a partial load holds only the requested keys, in that order.
 # One interleaved record per cell: an interpolation reads each stencil corner from one place.
-struct GRMHDSnapshot{F, Rp, Re, Tg, T, Um, Ub}
+# `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
+# point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
+struct GRMHDSnapshot{F, Rp, Re, Tg, T, Rt, Um, Ub}
     fluid::F
     r_prof::Rp
     r_extent::Re
     th_grid::Tg
     φ0::T
     dφ::T
+    R::Rt
     spin::T
     gam::T
     t::T
@@ -113,7 +116,7 @@ function load_koral_h5(path::AbstractString)
         φ0 = φ0_file + π
 
         rdscalar(name) = Float64(read(h5[name]))
-        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ,
+        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ, Val(one(SMatrix{3,3,Int})),
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
             rdscalar("header/units/M_unit"), rdscalar("header/units/M_bh"))
     end
@@ -185,7 +188,7 @@ function load_koral(store::ZGroup, snapname::AbstractString;
     sc(x) = Float64(x)
     hdr = store.attrs; units = hdr["units"]
     GRMHDSnapshot(fluid, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
-        sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
+        Val(one(SMatrix{3,3,Int})), sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
         sc(units["M_unit"]), sc(units["M_bh"]))
 end
 
@@ -239,7 +242,7 @@ function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = miss
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
         # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
         GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
-            sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
+            Val(one(SMatrix{3,3,Int})), sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
     end
 end
 
@@ -329,7 +332,7 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, ma
 
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
     GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), r_prof, first(r_prof)..last(r_prof), th_grid,
-        X(3, 0), dx[3]/2^tl[3], par.a, par.gam, par.t, M_unit, MBH)
+        X(3, 0), dx[3]/2^tl[3], Val(one(SMatrix{3,3,Int})), par.a, par.gam, par.t, M_unit, MBH)
 end
 
 # One stored cell: rho, ug, u^0..3, B^1..3, little-endian float32.
@@ -645,6 +648,6 @@ include("physics.jl")
 
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
     Adapt.adapt(to, s.fluid), Adapt.adapt(to, s.r_prof), s.r_extent, Adapt.adapt(to, s.th_grid),
-    s.φ0, s.dφ, s.spin, s.gam, s.t, s.M_unit, s.MBH)
+    s.φ0, s.dφ, s.R, s.spin, s.gam, s.t, s.M_unit, s.MBH)
 
 end

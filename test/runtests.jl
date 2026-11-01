@@ -76,7 +76,7 @@ end
 end
 
 @testitem "Adapt identity move preserves axis names & values" begin
-    using Adapt, NamedDims, Zarr
+    using Adapt, NamedDims, Zarr, StaticArrays
 
     snap = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
     snap2 = Adapt.adapt_structure(Array, snap)
@@ -84,6 +84,7 @@ end
     @test snap2.fluid == snap.fluid
     @test eltype(snap2.fluid) == eltype(snap.fluid)
     @test snap2.r_extent === snap.r_extent
+    @test snap2.R === snap.R === Val(one(SMatrix{3,3,Int}))
 end
 
 @testitem "raw .h5 cross-check (optional, isfile-guarded)" begin
