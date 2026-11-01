@@ -193,36 +193,33 @@ Code field unit c·√(4π·ρ_unit) in Gauss. Needs both `M_unit` and `MBH`.
 """
 bunit(snap::GRMHDSnapshot) = (_require_units(snap, :bunit, :M_unit, :MBH); ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap)))
 
-# ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.rho. For cell (φ=k,θ=j,r=i): coords r_prof[i],
-# th_grid[i,j]; primitives velrel/bfield[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
+# ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.fluid. For cell (φ=k,θ=j,r=i): coords r_prof[i],
+# th_grid[i,j]; fluid record fluid[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
 
 """
-    map_plasma(f, snap, extras...; threaded=true)
+    map_plasma(f, snap; threaded=true)
 
-Map a kernel `f(ps, g, cells)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
+Map a kernel `f(ps, g, cell)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
 [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `g` the per-cell [`grav_redshift`](@ref) √(−g_tt)
-— both reconstructed from `velrel`/`bfield` and the metric, so `rho` need not be loaded. `extras` are
-full `(:φ,:θ,:r)` `NamedDimsArray`s (e.g. `snap.rho`); their matching cells are collected into the
-tuple `cells` passed after `g` (`()` when no extras — passed as one argument, not splatted, so the
-per-cell call stays allocation-free). The Kerr-Schild metric (and hence `ps` and `g`) depends only on
-`(r,θ)`, so it is built once per `(r,θ)` slab and reused across all φ. The outer radial loop runs over
-`OhMyThreads.tmap` (`threaded`) or `map`.
+— both reconstructed from `cell.ũ`/`cell.B` and the metric — and `cell` is the cell's fluid record, so
+`ρ` need not be loaded unless `f` reads `cell.ρ`. The Kerr-Schild metric (and hence `ps` and `g`)
+depends only on `(r,θ)`, so it is built once per `(r,θ)` slab and reused across all φ. The outer radial
+loop runs over `OhMyThreads.tmap` (`threaded`) or `map`.
 """
-function map_plasma(f, snap::GRMHDSnapshot, extras::Vararg{Any,N}; threaded::Bool = true) where {N}
-    rr = 1:size(snap.velrel, :r)
-    slab(i) = _plasma_slab(f, snap, extras, i)      # function barrier → concrete slab element type
+function map_plasma(f, snap::GRMHDSnapshot; threaded::Bool = true)
+    rr = 1:size(snap.fluid, :r)
+    slab(i) = _plasma_slab(f, snap, i)      # function barrier → concrete slab element type
     slabs = threaded ? tmap(slab, rr) : map(slab, rr)
     NamedDimsArray(stack(slabs), (:φ, :θ, :r))
 end
 
 # One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and redshift zg are built once per θ and
 # reused across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
-function _plasma_slab(f, snap::GRMHDSnapshot, extras, i)
-    (; velrel, bfield, r_prof, th_grid, spin) = snap
-    nφ, nθ = size(velrel, :φ), size(velrel, :θ)
+function _plasma_slab(f, snap::GRMHDSnapshot, i)
+    (; fluid, r_prof, th_grid, spin) = snap
+    nφ, nθ = size(fluid, :φ), size(fluid, :θ)
     r = r_prof[i]
-    cell(k, j, g, zg) = f(_plasma_state(velrel[φ=k, θ=j, r=i], bfield[φ=k, θ=j, r=i], g), zg,
-                          map(e -> @inbounds(e[φ=k, θ=j, r=i]), extras))
+    cell(k, j, g, zg) = (c = fluid[φ=k, θ=j, r=i]; f(_plasma_state(c.ũ, c.B, g), zg, c))
     g1 = ks_gcov(r, th_grid[i, 1], spin)
     out = Matrix{typeof(cell(1, 1, g1, _grav_redshift(g1)))}(undef, nφ, nθ)
     @inbounds for j in 1:nθ
@@ -241,13 +238,13 @@ Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
 comoving_bsq(snap::GRMHDSnapshot) = map_plasma((ps, _, _) -> ps.bsq, snap)
 
-# Map a per-cell kernel of ONE primitive field + coords over the grid. Unlike `map_plasma` it touches
-# only `field` (velrel or bfield), so it works on a partially-loaded snapshot.
-function _grid_map1(f, field, snap::GRMHDSnapshot)
-    (; r_prof, th_grid, spin) = snap
-    nφ, nθ, nr = size(field)
+# Map a per-cell kernel `f(cell, r, θ, a)` of the fluid record + coords over the grid. Unlike `map_plasma`
+# it needs only the fields `f` reads, so it works on a partially-loaded snapshot.
+function _grid_map1(f, snap::GRMHDSnapshot)
+    (; fluid, r_prof, th_grid, spin) = snap
+    nφ, nθ, nr = size(fluid)
     NamedDimsArray(
-        [f(field[φ=k, θ=j, r=i], r_prof[i], th_grid[i, j], spin) for k in 1:nφ, j in 1:nθ, i in 1:nr],
+        [f(fluid[φ=k, θ=j, r=i], r_prof[i], th_grid[i, j], spin) for k in 1:nφ, j in 1:nθ, i in 1:nr],
         (:φ, :θ, :r))
 end
 
@@ -256,21 +253,21 @@ end
 
 Per-cell coordinate 3-velocity `v^i` [code units], as a `(:φ,:θ,:r)` array.
 """
-fluid_velocity(snap::GRMHDSnapshot) = _grid_map1(fluid_velocity, snap.velrel, snap)
+fluid_velocity(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> fluid_velocity(c.ũ, r, θ, a), snap)
 
 """
     flow_speed(snap)
 
 Per-cell physical speed `v/c` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-flow_speed(snap::GRMHDSnapshot) = _grid_map1(flow_speed, snap.velrel, snap)
+flow_speed(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> flow_speed(c.ũ, r, θ, a), snap)
 
 """
     proper_velocity(snap)
 
 Per-cell proper velocity `βγ = √(γ²−1)` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-proper_velocity(snap::GRMHDSnapshot) = _grid_map1(proper_velocity, snap.velrel, snap)
+proper_velocity(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> proper_velocity(c.ũ, r, θ, a), snap)
 
 """
     bfield_magnitude(snap)
@@ -278,7 +275,7 @@ proper_velocity(snap::GRMHDSnapshot) = _grid_map1(proper_velocity, snap.velrel, 
 Normal-frame magnitude of the lab 3-field `B^i`, `√(γᵢⱼBⁱBʲ)` [code units], as a `(:φ,:θ,:r)` array —
 the proper spatial-metric norm, not a raw component norm.
 """
-bfield_magnitude(snap::GRMHDSnapshot) = _grid_map1(spatial_norm, snap.bfield, snap)
+bfield_magnitude(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> spatial_norm(c.B, r, θ, a), snap)
 
 """
     comoving_B_gauss(snap)
@@ -292,7 +289,7 @@ comoving_B_gauss(snap::GRMHDSnapshot) = sqrt.(comoving_bsq(snap)) .* bunit(snap)
 
 Per-cell magnetization σ = b²/ρ [code units], as a `(:φ,:θ,:r)` array. ρ=0 cells are the natural `Inf`.
 """
-magnetization(snap::GRMHDSnapshot) = comoving_bsq(snap) ./ snap.rho
+magnetization(snap::GRMHDSnapshot) = map_plasma((ps, _, c) -> ps.bsq/c.ρ, snap)
 
 # Replicate a φ-invariant (r,θ) field over φ into a `(:φ,:θ,:r)` array (downstream texture consistency).
 function _phi_replicate(m, nφ)
@@ -304,18 +301,18 @@ end
 
 Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-lapse(snap::GRMHDSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+lapse(snap::GRMHDSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))
 
 """
     grav_redshift(snap)
 
 Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-grav_redshift(snap::GRMHDSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+grav_redshift(snap::GRMHDSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))
 
 """
     volume_ratio(snap)
 
 Per-cell proper-to-coordinate volume ratio √γ/(r²sinθ), as a `(:φ,:θ,:r)` array (φ-invariant).
 """
-volume_ratio(snap::GRMHDSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.velrel, :φ))
+volume_ratio(snap::GRMHDSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))

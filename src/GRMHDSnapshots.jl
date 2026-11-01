@@ -26,10 +26,11 @@ include("coordinates.jl")
 # H-AMR) store neither, and each can be supplied independently.
 # The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
 # `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
-struct GRMHDSnapshot{Ar, Av, Ab, Rp, Re, Tg, T, Um, Ub}
-    rho::Ar
-    velrel::Av
-    bfield::Ab
+# `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
+# (lab field B^i), vectors in Kerr-Schild components; a partial load holds only the requested keys, in that order.
+# One interleaved record per cell: an interpolation reads each stencil corner from one place.
+struct GRMHDSnapshot{F, Rp, Re, Tg, T, Um, Ub}
+    fluid::F
     r_prof::Rp
     r_extent::Re
     th_grid::Tg
@@ -100,11 +101,8 @@ end
 
 function load_koral_h5(path::AbstractString)
     h5open(path, "r") do h5
-        nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
         rd(name) = read(h5["quants/$name"])
-        rho = nd(rd("rho"))
-        sv3(a, b, c) = nd(SVector{3,Float64}.(a, b, c))
-        velrel = sv3(rd("U1"), rd("U2"), rd("U3")); bfield = sv3(rd("B1"), rd("B2"), rd("B3"))
+        fluid = _interleave(map(names -> _koral_column(Float64, map(rd, names)), _KORAL_COMPONENTS))
 
         r = read(h5["grid_out/r"]); th = read(h5["grid_out/th"]); ph = read(h5["grid_out/ph"])
         n1 = size(r, 3); n2 = size(r, 2); n3 = size(r, 1)
@@ -115,11 +113,29 @@ function load_koral_h5(path::AbstractString)
         φ0 = φ0_file + π
 
         rdscalar(name) = Float64(read(h5[name]))
-        GRMHDSnapshot(rho, velrel, bfield, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ,
+        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ,
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
             rdscalar("header/units/M_unit"), rdscalar("header/units/M_bh"))
     end
 end
+
+const _FLUID_KEYS = (:ρ, :ũ, :B)
+
+# The requested fluid fields in the canonical record order.
+function _fluid_keys(fields)
+    fields ⊆ _FLUID_KEYS || throw(ArgumentError("unknown fluid field(s) in $fields"))
+    isempty(fields) && throw(ArgumentError("no fluid fields requested"))
+    filter(in(fields), _FLUID_KEYS)
+end
+
+# koral datasets of each fluid field
+const _KORAL_COMPONENTS = (ρ = ("rho",), ũ = ("U1", "U2", "U3"), B = ("B1", "B2", "B3"))
+
+_koral_column(::Type, (a,)::Tuple{AbstractArray}) = a
+_koral_column(::Type{T}, cs::NTuple{3,AbstractArray}) where {T} = StructArrays.StructArray{SVector{3,T}}(cs)
+
+# Field arrays → one dense `(:φ,:θ,:r)` array of records, in a single pass; the StructArray is only a zero-copy view.
+_interleave(cols::NamedTuple) = NamedDimsArray(Array(StructArrays.StructArray(cols)), (:φ, :θ, :r))
 
 """
     load_grid(store)
@@ -144,43 +160,37 @@ function load_grid(store::ZGroup)
 end
 
 """
-    load_koral(store, snapname; fields=(:rho, :velrel, :bfield), grid=load_grid(store))
+    load_koral(store, snapname; fields=(:ρ, :ũ, :B), grid=load_grid(store))
 
 Load one snapshot from an open Zarr run store.
 
 # Arguments
 - `store`: Open Zarr run store.
 - `snapname`: Snapshot group name, e.g. `"snap002000"`.
-- `fields`: Fluid fields to read; subset of `(:rho, :velrel, :bfield)`.
+- `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`.
 - `grid`: Cached grid from `load_grid(store)`.
 
 # Returns
-- `GRMHDSnapshot`; unselected fields are `nothing`.
+- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float32`.
 """
 function load_koral(store::ZGroup, snapname::AbstractString;
-                    fields = (:rho, :velrel, :bfield), grid = load_grid(store))
-    fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
+                    fields = (:ρ, :ũ, :B), grid = load_grid(store))
+    ks = _fluid_keys(fields)
     snap = store[snapname]::ZGroup
-    nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
     rd(name) = Threads.@spawn snap[name][:, :, :]                # each zfp chunk decompresses independently
-    svf(ts) = nd(StructArrays.StructArray{SVector{3,Float32}}(map(fetch, ts)))
-    # launch every requested component up front so the reads decompress concurrently, then assemble
-    trho = :rho    in fields ? rd("rho")                   : nothing
-    tvel = :velrel in fields ? map(rd, ("U1", "U2", "U3")) : nothing
-    tbf  = :bfield in fields ? map(rd, ("B1", "B2", "B3")) : nothing
-    rho    = isnothing(trho) ? nothing : nd(fetch(trho))
-    velrel = isnothing(tvel) ? nothing : svf(tvel)
-    bfield = isnothing(tbf)  ? nothing : svf(tbf)
+    # launch every requested component up front so the reads decompress concurrently, then interleave
+    tasks = NamedTuple{ks}(map(k -> map(rd, _KORAL_COMPONENTS[k]), ks))
+    fluid = _interleave(map(ts -> _koral_column(Float32, map(fetch, ts)), tasks))
 
     sc(x) = Float64(x)
     hdr = store.attrs; units = hdr["units"]
-    GRMHDSnapshot(rho, velrel, bfield, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
+    GRMHDSnapshot(fluid, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
         sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
         sc(units["M_unit"]), sc(units["M_bh"]))
 end
 
 """
-    load_iharm(path; fields=(:rho, :velrel, :bfield), M_unit=missing, MBH=missing)
+    load_iharm(path; fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
 
 Load an iharm3d/KHARMA `.h5` dump in FMKS coordinates (`header/metric` == `"FMKS"`/`"MMKS"`).
 
@@ -190,15 +200,15 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 [`GRMHDSnapshot`] that all downstream physics/interpolation handles unchanged.
 
 # Arguments
-- `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
+- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
 - `M_unit`, `MBH`: physical units, `M_unit` in grams and `MBH` in M☉, each optional (default `missing`). These
   dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
 - `GRMHDSnapshot`.
 """
-function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
-    fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
+function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = missing, MBH = missing)
+    ks = _fluid_keys(fields)
     h5open(path, "r") do h5
         rd(name) = read(h5[name])
         metric = strip(c -> c == '\0' || c == ' ', rd("header/metric"))
@@ -220,24 +230,24 @@ function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_u
 
         # prims: HDF5 (n1,n2,n3,n_prim) row-major → Julia (n_prim,n3,n2,n1). Slots: 1=RHO, 3-5=U1-3, 6-8=B1-3.
         prims = rd("prims")
-        nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
-        rho = :rho in fields ? nd([prims[1, k, j, i] for k in 1:n3, j in 1:n2, i in 1:n1]) : nothing
         # native contravariant 3-vector → KS: v_KS = J₃·v_nat, J₃(r,θ) built once per (i,j) and reused over φ.
         J = [jacobian_spatial(coords, X1(i), X2(j)) for i in 1:n1, j in 1:n2]
-        tovec(s1, s2, s3) = nd([J[i, j] * SVector(prims[s1, k, j, i], prims[s2, k, j, i], prims[s3, k, j, i])
-                                for k in 1:n3, j in 1:n2, i in 1:n1])
-        velrel = :velrel in fields ? tovec(3, 4, 5) : nothing
-        bfield = :bfield in fields ? tovec(6, 7, 8) : nothing
+        tovec(s, k, j, i) = J[i, j] * SVector(prims[s, k, j, i], prims[s + 1, k, j, i], prims[s + 2, k, j, i])
+        cellf = (ρ = (k, j, i) -> prims[1, k, j, i], ũ = (k, j, i) -> tovec(3, k, j, i), B = (k, j, i) -> tovec(6, k, j, i))
+        fluid = NamedDimsArray(_cellmap(cellf[ks], (n3, n2, n1)), (:φ, :θ, :r))
 
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
         # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-        GRMHDSnapshot(rho, velrel, bfield, r_prof, first(r_prof)..last(r_prof), th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
+        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
             sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
     end
 end
 
+# The records `(; key = fs[key](k, j, i), …)` of every cell (k, j, i) of a grid of size `n`.
+_cellmap(fs::NamedTuple, n) = [map(f -> f(k, j, i), fs) for k in 1:n[1], j in 1:n[2], i in 1:n[3]]
+
 """
-    load_hamr(dir; rcyl, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:rho, :velrel, :bfield), M_unit=missing, MBH=missing)
+    load_hamr(dir; rcyl, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
 
 Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …), restricted to the radial cells
 whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range are read, and only their radial slabs within it.
@@ -254,7 +264,7 @@ output cell it covers, finer ones are averaged. Without caps every output cell i
 The dump stores the 4-velocity `u^μ` and lab field `B^i` in native components; each stored cell is transformed to
 Kerr-Schild components at its own center via the analytic spatial Jacobian, and `u^μ` is converted to the relative
 velocity `ũ^i`, before averaging. Stored values are used without correction, placed at the standard cell centers
-`startx + (i + 1/2)·h` (`i` the 0-based cell index, `h` the cell spacing at the block's level). Fluid arrays are
+`startx + (i + 1/2)·h` (`i` the 0-based cell index, `h` the cell spacing at the block's level). The `fluid` records are
 `Float32` (the dump precision); transforms and averages are computed in `Float64`.
 
 # Arguments
@@ -265,16 +275,15 @@ velocity `ũ^i`, before averaging. Stored values are used without correction, pl
 - `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
 - `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
   each a nonnegative integer, or `nothing` for no cap.
-- `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
+- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
 - `M_unit`, `MBH`: physical units (g, M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot`.
 """
 function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
-                   fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
-    fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
-    isempty(fields) && throw(ArgumentError("no fluid fields requested"))
+                   fields = (:ρ, :ũ, :B), M_unit = missing, MBH = missing)
+    ks = _fluid_keys(fields)
     keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
     all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
         throw(ArgumentError("maxlevel values must be nonnegative integers or nothing, got $maxlevel"))
@@ -302,17 +311,12 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, ma
     r_prof  = map(i -> exp(X(1, i)), ir)
     th_grid = [last(bl_coord(coords, X(1, i), X(2, j))) for i in ir, j in 0:n[2]-1]
 
-    sz = (n[3], n[2], length(ir))
-    svf() = StructArrays.StructArray{SVector{3,Float32}}(ntuple(_ -> Array{Float32}(undef, sz), 3))
-    outs = (; rho    = :rho    in fields ? Array{Float32}(undef, sz) : nothing,
-              velrel = :velrel in fields ? svf() : nothing,
-              bfield = :bfield in fields ? svf() : nothing)
+    zero32 = (ρ = 0f0, ũ = zero(SVector{3,Float32}), B = zero(SVector{3,Float32}))
+    outs = Array{typeof(zero32[ks])}(undef, n[3], n[2], length(ir))
     rel = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ ir), blocks)    # every block contributing to the output
-    geo = isnothing(outs.velrel) && isnothing(outs.bfield) ? nothing : _hamr_cell_geometry(rel, par, coords, tl, ir)
+    geo = :ũ in ks || :B in ks ? _hamr_cell_geometry(rel, par, coords, tl, ir) : nothing
     # Float64 sums for averaged cells; weights add to 1 per output cell since blocks tile, `w > 0` marks them
-    z =(; w = 0.0, rho = isnothing(outs.rho) ? nothing : 0.0,
-           velrel = isnothing(outs.velrel) ? nothing : zero(SVector{3,Float64}),
-           bfield = isnothing(outs.bfield) ? nothing : zero(SVector{3,Float64}))
+    z = merge((; w = 0.0), (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks])
     # each task owns whole radial chunks of the output (a few per thread, for balance), so no two tasks write the same cell
     @tasks for cr in chunks(ir; n = 4Threads.nthreads())
         @local row = Vector{typeof(z)}(undef, bs[3])
@@ -323,9 +327,8 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing, ma
         isnothing(sums) || foreach(I -> iszero(sums[I].w) || _hamr_put!(outs, ro, Tuple(I)..., sums[I], 1), CartesianIndices(sums))
     end
 
-    nd(A) = isnothing(A) ? nothing : NamedDimsArray(A, (:φ, :θ, :r))
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-    GRMHDSnapshot(nd(outs.rho), nd(outs.velrel), nd(outs.bfield), r_prof, first(r_prof)..last(r_prof), th_grid,
+    GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), r_prof, first(r_prof)..last(r_prof), th_grid,
         X(3, 0), dx[3]/2^tl[3], par.a, par.gam, par.t, M_unit, MBH)
 end
 
@@ -363,12 +366,10 @@ end
 # block no finer than the output: each output cell lies in one stored cell, written directly
 _hamr_iscopy(b, tl) = all(≥(0), tl .- b.level)
 
-Base.@propagate_inbounds function _hamr_put!(outs::NamedTuple, ro, ko, jo, it, c, w)
-    isnothing(outs.rho)    || (outs.rho[ko, jo, it + ro] = c.rho)
-    isnothing(outs.velrel) || (outs.velrel[ko, jo, it + ro] = c.velrel)
-    isnothing(outs.bfield) || (outs.bfield[ko, jo, it + ro] = c.bfield)
-end
-Base.@propagate_inbounds _hamr_put!(A::AbstractArray, ro, ko, jo, it, c, w) = A[ko, jo, it] = map((x, y) -> isnothing(x) ? x : x + w*y, A[ko, jo, it], c)
+# Into the output records (radial offset `ro`): the cell without its weight, in the output precision.
+Base.@propagate_inbounds _hamr_put!(outs::AbstractArray{R}, ro, ko, jo, it, c, w) where {R} = outs[ko, jo, it + ro] = convert(R, NamedTuple{fieldnames(R)}(c))
+# Into the sums, which have the cell's own element type: weighted accumulation.
+Base.@propagate_inbounds _hamr_put!(sums::AbstractArray{E}, ro, ko, jo, it, c::E, w) where {E} = sums[ko, jo, it] = map((x, y) -> x + w*y, sums[ko, jo, it], c)
 
 # Put block `b`'s stored cells overlapping the output radial cells `cr` into `sink` (radial index local to `cr`), each
 # converted to KS at its own center and weighted by its overlap. Stored cells: φ fastest, then θ, then r.
@@ -394,12 +395,15 @@ function _hamr_scatter!(sink, ro, row, b, par, geo, tl, cr)
     end
 end
 
-# Stored cell `p` with KS components at its center (geometry `gc`), as the sums element type `E`: unit weight, then the
-# requested fields. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column.
-_hamr_ks(p::HAMRCell, gc, ::Type{E}) where {E} = E((1.0,
-    fieldtype(E, :rho)    === Nothing ? nothing : p[1],
-    fieldtype(E, :velrel) === Nothing ? nothing : gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), gc.g),
-    fieldtype(E, :bfield) === Nothing ? nothing : gc.J*p[SVector(7, 8, 9)]))
+# Stored cell `p` with KS components at its center (geometry `gc`), as the sums element type `E`: unit weight `w`, then the
+# requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by the static `K` keeps it
+# type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column.
+function _hamr_ks(p::HAMRCell, gc, ::Type{E}) where {K, E<:NamedTuple{K}}
+    fs = (w = () -> 1.0, ρ = () -> p[1],
+          ũ = () -> gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), gc.g),
+          B = () -> gc.J*p[SVector(7, 8, 9)])
+    E(map(f -> f(), NamedTuple{K}(fs)))
+end
 
 struct HAMROldLayout end
 struct HAMRNewLayout end
@@ -609,7 +613,7 @@ end
 _zero(::Type{T}) where {T} = zero(T)
 _zero(::Type{T}) where {T<:NamedTuple} = T(map(_zero, fieldtypes(T)))
 
-# Apply a precomputed stencil to a single field array.
+# Apply a precomputed stencil to a field array.
 @inline function _apply_stencil(st, A)
     face(ir, jj, tj) = @inbounds _lerp(_lerp(A[φ=st.k, θ=jj, r=ir], A[φ=st.k, θ=jj+1, r=ir], tj),
                                        _lerp(A[φ=st.kp, θ=jj, r=ir], A[φ=st.kp, θ=jj+1, r=ir], tj), st.tk)
@@ -617,52 +621,30 @@ _zero(::Type{T}) where {T<:NamedTuple} = T(map(_zero, fieldtypes(T)))
 end
 
 """
-    sample_field(snapshot, field_array, x, y, z)
+    sample(snapshot, x, y, z)
 
-Interpolate a single fluid field array (e.g. `snap.velrel`, or an array of NamedTuple records) at Cartesian `(x, y, z)`.
+Trilinearly interpolate the fluid record at Cartesian position `(x, y, z)`, field by field.
 
 # Arguments
-- `snapshot`: Loaded `GRMHDSnapshot`.
-- `field_array`: One `(φ, θ, r)` field array, e.g. `snap.rho`, `snap.velrel`, or `snap.bfield`.
+- `snapshot`: Loaded `GRMHDSnapshot`, with any subset of the fluid fields.
 - `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
 
 # Returns
-- Interpolated value (a record for NamedTuple elements); zero outside the grid.
+- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, in the grid precision (`eltype(snapshot.r_prof)`); zeros
+  outside the grid.
 """
-@inline function sample_field(s::GRMHDSnapshot, A, x, y, z)
+@inline function sample(s::GRMHDSnapshot, x, y, z)
+    A = s.fluid
     st = _sample_stencil(s, size(A, :φ), x, y, z)
     # `_lerp` with a weight promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
     z0 = _zero(eltype(A))
     st === nothing ? _lerp(z0, z0, one(eltype(s.r_prof))) : _apply_stencil(st, A)
 end
 
-"""
-    sample(snapshot, x, y, z)
-
-Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
-
-# Arguments
-- `snapshot`: Loaded `GRMHDSnapshot` with all fluid fields present.
-- `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
-
-# Returns
-- Tuple `(rho, velrel, bfield)`.
-"""
-@inline function sample(s::GRMHDSnapshot, x, y, z)
-    st = _sample_stencil(s, size(s.rho, :φ), x, y, z)
-    if st === nothing
-        # Match the interpolation result type.
-        T = promote_type(eltype(s.rho), eltype(s.r_prof)); z3 = zero(SVector{3,T})
-        return (zero(T), z3, z3)
-    end
-    return (_apply_stencil(st, s.rho), _apply_stencil(st, s.velrel), _apply_stencil(st, s.bfield))
-end
-
 include("physics.jl")
 
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
-    Adapt.adapt(to, s.rho), Adapt.adapt(to, s.velrel), Adapt.adapt(to, s.bfield),
-    Adapt.adapt(to, s.r_prof), s.r_extent, Adapt.adapt(to, s.th_grid),
+    Adapt.adapt(to, s.fluid), Adapt.adapt(to, s.r_prof), s.r_extent, Adapt.adapt(to, s.th_grid),
     s.φ0, s.dφ, s.spin, s.gam, s.t, s.M_unit, s.MBH)
 
 end

@@ -14,14 +14,14 @@ using TestItemRunner
 
     snap = load_koral(store, "snap002000")
     @test snap isa GRMHDSnapshot
-    @test size(snap.rho) == (24, 32, 48)
-    @test size(snap.velrel) == (24, 32, 48)
-    @test size(snap.bfield) == (24, 32, 48)
+    @test size(snap.fluid) == (24, 32, 48)
+    @test parent(snap.fluid) isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
     @test r_min(snap) < r_max(snap)
     @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
     @test all(>(0), diff(snap.r_prof))
 
-    ρ, ũ, B = @inferred sample(snap, 5.0, 0.0, 0.0)
+    (; ρ, ũ, B) = rec5 = @inferred sample(snap, 5.0, 0.0, 0.0)
+    @test rec5 isa @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
     @test ρ isa Float64 && isfinite(ρ)
     @test ũ isa SVector{3,Float64} && all(isfinite, ũ)
     @test B isa SVector{3,Float64} && all(isfinite, B)
@@ -29,45 +29,41 @@ using TestItemRunner
     i, j, k = 20, 16, 12
     rn = snap.r_prof[i]; θn = snap.th_grid[i, j]; φn = snap.φ0 + (k - 1) * snap.dφ
     xn = rn * sin(θn) * cos(φn); yn = rn * sin(θn) * sin(φn); zn = rn * cos(θn)
-    @test first(sample(snap, xn, yn, zn)) ≈ snap.rho[φ=k, θ=j, r=i]
+    @test sample(snap, xn, yn, zn).ρ ≈ snap.fluid[φ=k, θ=j, r=i].ρ
 
-    ρ0, ũ0, B0 = @inferred sample(snap, 0.0, 0.0, 10 * r_max(snap))
-    @test ρ0 == 0 && iszero(ũ0) && iszero(B0)
+    rec0 = @inferred sample(snap, 0.0, 0.0, 10 * r_max(snap))
+    @test rec0 === (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))
 
-    snap_rho = load_koral(store, "snap002000"; fields = (:rho,))
-    @test snap_rho.velrel === nothing && snap_rho.bfield === nothing
-    @test_throws MethodError sample(snap_rho, 5.0, 0.0, 0.0)
-
-    # single-field interpolation: matches the bundled result, needs only its own field
-    using GRMHDSnapshots: sample_field
-    @test @inferred(sample_field(snap, snap.velrel, 5.0, 0.0, 0.0)) == ũ
-    @test @inferred(sample_field(snap, snap.rho, xn, yn, zn)) ≈ snap.rho[φ=k, θ=j, r=i]
-    B0f = @inferred sample_field(snap, snap.bfield, 0.0, 0.0, 10 * r_max(snap))
-    @test B0f isa SVector{3,Float64} && iszero(B0f)
-
-    snap_vel = load_koral(store, "snap002000"; fields = (:velrel,))
-    @test snap_vel.rho === nothing && snap_vel.bfield === nothing
-    @test sample_field(snap_vel, snap_vel.velrel, 5.0, 0.0, 0.0) == ũ   # works with rho/bfield absent
-
-    # arrays of NamedTuple records: interpolated field by field, bitwise equal to the separate arrays
+    # partial loads: the records hold the requested fields only, always in the order (ρ, ũ, B); each is the same data
     using NamedDims
-    recs = NamedDimsArray(map((ρ, ũ, B) -> (; ρ, ũ, B), parent(snap.rho), parent(snap.velrel), parent(snap.bfield)), (:φ, :θ, :r))
-    @test eltype(recs) == @NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}
+    for (fields, K) in (((:ρ,), (:ρ,)), ((:ũ,), (:ũ,)), ((:B,), (:B,)), ((:B, :ũ), (:ũ, :B)), ((:B, :ρ), (:ρ, :B)),
+                        ((:ũ, :ρ), (:ρ, :ũ)), ((:B, :ũ, :ρ), (:ρ, :ũ, :B)))
+        sp = load_koral(store, "snap002000"; fields)
+        @test fieldnames(eltype(sp.fluid)) == K
+        @test parent(sp.fluid) isa Array && dimnames(sp.fluid) == (:φ, :θ, :r)
+        @test sp.fluid == map(c -> c[K], snap.fluid)
+    end
+    @test_throws ArgumentError load_koral(store, "snap002000"; fields = ())
+    @test_throws ArgumentError load_koral(store, "snap002000"; fields = (:rho,))
+
+    # sample on full and partial snapshots: each field interpolated independently of the others, so a partial record
+    # is bitwise the matching part of the full one; out-of-grid zeros have the in-grid type
     # φ = 0 is across the φ wrap (φ0 > 0); y = ±0 straddles atan's ±π; z-axis points are at the θ edges
     pts_in = [(5.0, 0.0, 0.0), (-7.0, -1e-9, 0.3), (-7.0, 1e-9, 0.3), (0.0, 0.0, 6.0), (0.0, 0.0, -6.0), (1e-6, 0.0, 8.0), (xn, yn, zn), (3.0, -4.0, 2.0)]
     pts_out = [(0.0, 0.0, 10 * r_max(snap)), (0.1 * r_min(snap), 0.0, 0.0)]
     RT = @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+    @test all(p -> @inferred(sample(snap, p...)) isa RT, [pts_in; pts_out])
+    @test all(p -> sample(snap, p...) === (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64})), pts_out)
+    snap_rho = load_koral(store, "snap002000"; fields = (:ρ,))
+    snap_vel = load_koral(store, "snap002000"; fields = (:ũ,))
+    snap_vb = load_koral(store, "snap002000"; fields = (:ũ, :B))
     for p in [pts_in; pts_out]
-        rec = @inferred sample_field(snap, recs, p...)
-        @test rec isa RT
-        @test rec.ρ === sample_field(snap, snap.rho, p...)
-        @test rec.ũ === sample_field(snap, snap.velrel, p...)
-        @test rec.B === sample_field(snap, snap.bfield, p...)
+        full = sample(snap, p...)
+        @test @inferred(sample(snap_rho, p...)) === (; full.ρ)
+        @test @inferred(sample(snap_vel, p...)) === (; full.ũ)
+        @test @inferred(sample(snap_vb, p...)) === (; full.ũ, full.B)
     end
-    @test all(p -> sample_field(snap, recs, p...) === (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64})), pts_out)
-
-    recs_u = NamedDimsArray(map(ũ -> (; ũ), parent(snap.velrel)), (:φ, :θ, :r))
-    @test all(p -> @inferred(sample_field(snap, recs_u, p...)) === (; ũ = sample_field(snap, snap.velrel, p...)), [pts_in; pts_out])
+    @test sample(snap_vel, 5.0, 0.0, 0.0).ũ == ũ
 end
 
 @testitem "extension-sniffing (one-arg zarr snap path)" begin
@@ -76,7 +72,7 @@ end
     store_path = joinpath(@__DIR__, "data", "koral_sample.zarr")
     snap1 = load_koral(joinpath(store_path, "snap002000"))
     snap2 = load_koral(zopen(store_path, "r"), "snap002000")
-    @test snap1.rho == snap2.rho
+    @test snap1.fluid == snap2.fluid
 end
 
 @testitem "Adapt identity move preserves axis names & values" begin
@@ -84,11 +80,9 @@ end
 
     snap = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
     snap2 = Adapt.adapt_structure(Array, snap)
-    @test dimnames(snap2.rho) == dimnames(snap.rho) == (:φ, :θ, :r)
-    @test dimnames(snap2.velrel) == (:φ, :θ, :r)
-    @test snap2.rho == snap.rho
-    @test snap2.velrel == snap.velrel
-    @test snap2.bfield == snap.bfield
+    @test dimnames(snap2.fluid) == dimnames(snap.fluid) == (:φ, :θ, :r)
+    @test snap2.fluid == snap.fluid
+    @test eltype(snap2.fluid) == eltype(snap.fluid)
     @test snap2.r_extent === snap.r_extent
 end
 
@@ -102,7 +96,8 @@ end
         @test r_min(s) < r_max(s)
         @test (r_min(s), r_max(s)) == (s.r_prof[1], s.r_prof[end])
         @test all(>(0), diff(s.r_prof))
-        ρ, ũ, B = sample(s, 5.0, 0.0, 0.0)
+        @test eltype(s.fluid) == @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+        (; ρ, ũ, B) = @inferred sample(s, 5.0, 0.0, 0.0)
         @test isfinite(ρ) && all(isfinite, ũ) && all(isfinite, B)
 
         s_store = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
@@ -111,8 +106,8 @@ end
             b = read(h5[hpath])[sl...]
             maximum(abs.(Float64.(collect(loaded)) .- b)) / maximum(abs.(b))
         end
-        re_rho = scale_relerr(s_store.rho, "quants/rho")
-        re_B1 = scale_relerr(map(v -> v[1], s_store.bfield), "quants/B1")
+        re_rho = scale_relerr(map(c -> c.ρ, s_store.fluid), "quants/rho")
+        re_B1 = scale_relerr(map(c -> c.B[1], s_store.fluid), "quants/B1")
         @test 0.010 < re_rho < 0.020
         @test 0.004 < re_B1 < 0.012
     else
@@ -133,7 +128,7 @@ end
     # u·u = -1 (timelike, normalized) and b·u = 0 (comoving field ⊥ 4-velocity), bsq ≥ 0.
     for (i, j, k) in ((20, 16, 12), (10, 8, 3), (40, 24, 20), (5, 30, 1))
         r = snap.r_prof[i]; θ = snap.th_grid[i, j]
-        ũ = snap.velrel[φ=k, θ=j, r=i]; B = snap.bfield[φ=k, θ=j, r=i]
+        (; ũ, B) = snap.fluid[φ=k, θ=j, r=i]
         g = ks_gcov(r, θ, a)
         (; u, b, bsq) = plasma_state(ũ, B, r, θ, a)
         @test u' * g * u ≈ -1 rtol = 1e-6
@@ -169,48 +164,57 @@ end
     # Grid arrays: correct shape/names, finite where ρ>0, kernel-consistent.
     bsqg = comoving_bsq(snap)
     @test dimnames(bsqg) == (:φ, :θ, :r)
-    @test size(bsqg) == size(snap.rho)
+    @test size(bsqg) == size(snap.fluid)
     @test all(≥(0), bsqg)
     @test all(isfinite, comoving_B_gauss(snap))
     lap = lapse(snap)
-    @test size(lap) == size(snap.rho) && all(α -> 0 < α ≤ 1, lap)
+    @test size(lap) == size(snap.fluid) && all(α -> 0 < α ≤ 1, lap)
     σ = magnetization(snap)
-    @test all(isfinite, σ[snap.rho .> 0])
+    @test all(isfinite, σ[map(c -> c.ρ > 0, snap.fluid)])
+    @test σ == comoving_bsq(snap) ./ map(c -> c.ρ, snap.fluid)
 
     # comoving_bsq grid value equals the kernel on that cell's primitives.
     i, j, k = 20, 16, 12
-    @test bsqg[φ=k, θ=j, r=i] ≈ plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
+    @test bsqg[φ=k, θ=j, r=i] ≈ plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B,
                                              snap.r_prof[i], snap.th_grid[i, j], a).bsq
 
     # map_plasma hoists the (r,θ)-only metric across φ and threads over r: over the whole grid it must
     # match a naive per-cell reconstruction (independent reference) up to FMA reassociation, and its
     # result must be bit-identical regardless of thread count.
-    nφ, nθ, nr = size(snap.rho)
-    bsq_ref = [plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i],
+    nφ, nθ, nr = size(snap.fluid)
+    bsq_ref = [plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B,
                             snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
     @test map_plasma((ps, _, _) -> ps.bsq, snap; threaded = true) ==
           map_plasma((ps, _, _) -> ps.bsq, snap; threaded = false)
     @inferred comoving_bsq(snap)
 
-    # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no rho needed (regression:
-    # map_plasma used to index snap.rho for every kernel, crashing on a rho-less snapshot).
-    snap_bv = load_koral(store, "snap002000"; fields = (:velrel, :bfield))
-    @test snap_bv.rho === nothing
+    # map_plasma's kernel gets the cell's record
+    @test map_plasma((_, _, c) -> c.ρ, snap) == map(c -> c.ρ, snap.fluid)
+
+    # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no ρ needed.
+    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B))
+    @test !hasfield(eltype(snap_bv.fluid), :ρ)
     @test comoving_bsq(snap_bv) == bsqg
     @test comoving_B_gauss(snap_bv) == comoving_B_gauss(snap)
+    # the single-field grid maps need only their own field
+    snap_u = load_koral(store, "snap002000"; fields = (:ũ,)); snap_b = load_koral(store, "snap002000"; fields = (:B,))
+    @test flow_speed(snap_u) == flow_speed(snap) && proper_velocity(snap_u) == proper_velocity(snap)
+    @test fluid_velocity(snap_u) == fluid_velocity(snap)
+    @test bfield_magnitude(snap_b) == bfield_magnitude(snap)
+    @test lapse(snap_b) == lapse(snap)
 
     # lapse(snap) is φ-invariant and equals the scalar lapse at each (r,θ), exactly.
     @test lap == [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
     # grav_redshift(snap) is φ-invariant and equals the scalar grav_redshift at each (r,θ), exactly.
     zg = grav_redshift(snap)
-    @test size(zg) == size(snap.rho) && all(x -> 0 ≤ x ≤ 1, zg)
+    @test size(zg) == size(snap.fluid) && all(x -> 0 ≤ x ≤ 1, zg)
     @test zg == [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
     # volume_ratio(snap) is φ-invariant, equals the scalar at each (r,θ), and is ≥ 1 everywhere.
     vr = volume_ratio(snap)
-    @test size(vr) == size(snap.rho) && all(≥(1), vr)
+    @test size(vr) == size(snap.fluid) && all(≥(1), vr)
     @test vr == [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
     # Unit scalars are plain CGS Float64; koral stores M_bh = 6.5e9 M☉.
@@ -389,7 +393,12 @@ end
     end
 
     snap = load_iharm(path)
-    @test size(snap.rho) == (n3, n2, n1) && size(snap.velrel) == (n3, n2, n1)
+    @test size(snap.fluid) == (n3, n2, n1)
+    @test eltype(snap.fluid) == @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+    sp = load_iharm(path; fields = (:B, :ρ))
+    @test eltype(sp.fluid) == @NamedTuple{ρ::Float64, B::SVector{3,Float64}} && sp.fluid == map(c -> (; c.ρ, c.B), snap.fluid)
+    @test_throws ArgumentError load_iharm(path; fields = ())
+    @test_throws ArgumentError load_iharm(path; fields = (:velrel,))
     @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
     @test snap.M_unit === missing && snap.MBH === missing         # scale-free by default
     @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
@@ -406,7 +415,7 @@ end
     foreach(f -> @test_throws("$f needs MBH (M☉)", f(snapm)), (lunit, rhounit, bunit))
     # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
     snapbm = @set snapb.M_unit = 1e26
-    @test snapbm.M_unit === 1e26 && snapbm.rho == snap.rho
+    @test snapbm.M_unit === 1e26 && snapbm.fluid == snap.fluid
     @test rhounit(snapbm) ≈ 1e26/lunit(snapb)^3 && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
     @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
     @test (@set snapbm.M_unit = missing).M_unit === missing
@@ -418,10 +427,10 @@ end
         r, th = bl_coord(c, X1, X2); J = jacobian_spatial(c, X1, X2)
         @test snap.r_prof[i] ≈ r
         @test snap.th_grid[i, j] ≈ th
-        @test snap.rho[φ=k, θ=j, r=i] ≈ prims[1, k, j, i]
-        @test snap.velrel[φ=k, θ=j, r=i] ≈ J*SVector(prims[3, k, j, i], prims[4, k, j, i], prims[5, k, j, i])
-        @test snap.bfield[φ=k, θ=j, r=i] ≈ J*SVector(prims[6, k, j, i], prims[7, k, j, i], prims[8, k, j, i])
-        u = plasma_state(snap.velrel[φ=k, θ=j, r=i], snap.bfield[φ=k, θ=j, r=i], r, th, par.a).u
+        @test snap.fluid[φ=k, θ=j, r=i].ρ ≈ prims[1, k, j, i]
+        @test snap.fluid[φ=k, θ=j, r=i].ũ ≈ J*SVector(prims[3, k, j, i], prims[4, k, j, i], prims[5, k, j, i])
+        @test snap.fluid[φ=k, θ=j, r=i].B ≈ J*SVector(prims[6, k, j, i], prims[7, k, j, i], prims[8, k, j, i])
+        u = plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B, r, th, par.a).u
         @test u' * ks_gcov(r, th, par.a) * u ≈ -1 rtol = 1e-10   # valid 4-velocity after transform
     end
 end
@@ -433,7 +442,7 @@ end
     path = joinpath(@__DIR__, "data", "iharm_fmks_a0.h5")
     if isfile(path)
         snap = load_iharm(path)
-        @test size(snap.rho) == (128, 128, 288)
+        @test size(snap.fluid) == (128, 128, 288)
         @test r_min(snap) < r_max(snap) && all(>(0), diff(snap.r_prof))
         @test snap.spin == 0.0
 
@@ -442,7 +451,7 @@ end
         snapu = load_iharm(path; M_unit = 1e26, MBH = 6.5e9)
         @test lunit(snapu) > 0 && rhounit(snapu) > 0 && bunit(snapu) > 0
         # auto-detect routes an FMKS .h5 to load_iharm.
-        @test load_snapshot(path).rho == snap.rho
+        @test load_snapshot(path).fluid == snap.fluid
 
         # Golden values from pyharm (see gen_fmks_golden.py), an independent reference reader.
         # 0-based native (i=radial, j=θ, k=φ); bsq/sigma/Gamma are frame-invariant ⇒ compared directly.
@@ -453,8 +462,8 @@ end
         for (i, j, k, rg, thg, rhog, bsqg, sigg, Gamg) in gold
             I, J, K = i+1, j+1, k+1
             r = snap.r_prof[I]; th = snap.th_grid[I, J]; a = snap.spin
-            rho = snap.rho[φ=K, θ=J, r=I]
-            ps = plasma_state(snap.velrel[φ=K, θ=J, r=I], snap.bfield[φ=K, θ=J, r=I], r, th, a)
+            rho = snap.fluid[φ=K, θ=J, r=I].ρ
+            ps = plasma_state(snap.fluid[φ=K, θ=J, r=I].ũ, snap.fluid[φ=K, θ=J, r=I].B, r, th, a)
             Γ = lapse(r, th, a) * ps.u[1]
             @test r ≈ rg rtol = 1e-8
             @test th ≈ thg rtol = 1e-8
@@ -520,14 +529,18 @@ end
     dir = joinpath(@__DIR__, "data", "hamr_dumps1000")
     if isfile(joinpath(dir, "parameters"))
         snap = load_hamr(dir; rcyl = 24.32, rmax = 1.235)      # the innermost 5 radial cells, all fields
-        @test size(snap.rho) == size(snap.velrel) == (1024, 1056, 5)
+        @test size(snap.fluid) == (1024, 1056, 5)
         @test snap.t == 5993.937771363162 && snap.spin == 0.9375 && snap.gam == 4/3
         @test snap.dφ ≈ 2π/1024 && snap.φ0 ≈ π/1024
         @test snap.r_prof[1] ≈ 1.2154603380902425 rtol = 1e-14         # gdump-stored r, θ of cell (i=0, j=22)
         @test snap.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
-        @test all(>(0), snap.rho)
-        @test all(v -> all(isfinite, v), snap.velrel) && all(v -> all(isfinite, v), snap.bfield)
-        @test load_snapshot(dir; rcyl = 24.32, rmax = 1.221).rho == snap.rho[r=1:2]
+        @test all(c -> c.ρ > 0, snap.fluid)
+        @test all(c -> all(isfinite, c.ũ) && all(isfinite, c.B), snap.fluid)
+        @test load_snapshot(dir; rcyl = 24.32, rmax = 1.221).fluid == snap.fluid[r=1:2]
+        # partial: the requested fields in the order (ρ, ũ, B), the same data
+        sp = load_hamr(dir; rcyl = 24.32, rmax = 1.235, fields = (:B, :ρ))
+        @test eltype(sp.fluid) == @NamedTuple{ρ::Float32, B::SVector{3,Float32}}
+        @test sp.fluid == map(c -> (; c.ρ, c.B), snap.fluid)
 
         # Raw cells by independent byte arithmetic: block → (new_dumpN, slot) from the verified block table;
         # 9 float32 per cell (rho, ug, u^0..3, B^1..3), k fastest, then j, then i.
@@ -545,19 +558,19 @@ end
         for ii in 0:4, jj in (0, 3, 21), kk in (0, 7, 31)
             p = raw(0, 86, ii, jj, kk)
             i, j = ii, 8*22 + jj
-            @test snap.rho[φ=kk+1, θ=j+1, r=i+1] == p[1]
-            u = fluid_ucon(snap.velrel[φ=kk+1, θ=j+1, r=i+1], snap.r_prof[i+1], snap.th_grid[i+1, j+1], snap.spin)
+            @test snap.fluid[φ=kk+1, θ=j+1, r=i+1].ρ == p[1]
+            u = fluid_ucon(snap.fluid[φ=kk+1, θ=j+1, r=i+1].ũ, snap.r_prof[i+1], snap.th_grid[i+1, j+1], snap.spin)
             @test u[1] ≈ p[3] rtol = 1e-5
             @test u[SVector(2, 3, 4)] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(4, 5, 6)] rtol = 1e-5
-            @test snap.bfield[φ=kk+1, θ=j+1, r=i+1] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(7, 8, 9)] rtol = 1e-5
+            @test snap.fluid[φ=kk+1, θ=j+1, r=i+1].B ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(7, 8, 9)] rtol = 1e-5
         end
         # level-0 pole blocks 0 and 31 (COORD3 = 0, 1) = new_dump0 slots 0, 1: each coarse cell m is copied into the
         # 16 fine cells it covers, 16m+1 … 16m+16 (1-based).
         for ii in 0:4, jj in (0, 5, 21), (slot, kk) in ((0, 0), (0, 2), (1, 31))
             p = raw(0, slot, ii, jj, kk); m = 32*slot + kk
-            @test snap.rho[φ=16m+1:16m+16, θ=jj+1, r=ii+1] == fill(p[1], 16)
-            @test snap.bfield[φ=16m+1:16m+16, θ=jj+1, r=ii+1] == fill(snap.bfield[φ=16m+1, θ=jj+1, r=ii+1], 16)
-            @test snap.bfield[φ=16m+1, θ=jj+1, r=ii+1] ≈ jacobian_spatial(c, X1(ii), X2(jj))*p[SVector(7, 8, 9)] rtol = 1e-5
+            @test map(c -> c.ρ, snap.fluid[φ=16m+1:16m+16, θ=jj+1, r=ii+1]) == fill(p[1], 16)
+            @test map(c -> c.B, snap.fluid[φ=16m+1:16m+16, θ=jj+1, r=ii+1]) == fill(snap.fluid[φ=16m+1, θ=jj+1, r=ii+1].B, 16)
+            @test snap.fluid[φ=16m+1, θ=jj+1, r=ii+1].B ≈ jacobian_spatial(c, X1(ii), X2(jj))*p[SVector(7, 8, 9)] rtol = 1e-5
         end
     else
         @test_skip "H-AMR dump dir absent"
@@ -613,9 +626,9 @@ end
         snap = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2)
         @test snap.t == 250000.0048901291 && snap.spin == 0.9375
         @test snap.gam ≈ 13/9 rtol = 1e-15
-        @test size(snap.rho) == size(snap.velrel) == size(snap.bfield) == (192, 192, 3)
-        @test dimnames(snap.rho) == (:φ, :θ, :r)
-        @test eltype(snap.rho) == Float32 && eltype(snap.velrel) == eltype(snap.bfield) == SVector{3,Float32}
+        @test size(snap.fluid) == (192, 192, 3)
+        @test dimnames(snap.fluid) == (:φ, :θ, :r)
+        @test parent(snap.fluid) isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
         @test snap.M_unit === missing && snap.MBH === missing
 
         # level-1 spacings: half the level-0 ones log(Rout/Rin)/420, 2·0.98958…/96, 2π/96
@@ -642,62 +655,67 @@ end
         # block 25969 = new_dump6 slot 0, levels (1, 1, 1), COORD (2, 1, 1): its level-1 cells are copied as-is
         for ii in 4:6, jj in (0, 7, 15), kk in (0, 11, 23)
             p = raw(6, ii, jj, kk); i, j, k = 70 + ii, 16 + jj, 24 + kk
-            @test snap.rho[φ=k+1, θ=j+1, r=i-73] == p[1]
-            @test snap.velrel[φ=k+1, θ=j+1, r=i-73] ≈ ũ(i, j, p) rtol = 1e-6
-            @test snap.bfield[φ=k+1, θ=j+1, r=i-73] ≈ J(i, j)*p[SVector(7, 8, 9)] rtol = 1e-6
+            @test snap.fluid[φ=k+1, θ=j+1, r=i-73].ρ == p[1]
+            @test snap.fluid[φ=k+1, θ=j+1, r=i-73].ũ ≈ ũ(i, j, p) rtol = 1e-6
+            @test snap.fluid[φ=k+1, θ=j+1, r=i-73].B ≈ J(i, j)*p[SVector(7, 8, 9)] rtol = 1e-6
         end
         # block 24989 = new_dump8 slot 0, levels (1, 1, 0), COORD (2, 0, 0): each φ cell copied into 2 output cells
         for ii in 4:6, jj in (0, 9), kk in (0, 23)
             p = raw(8, ii, jj, kk)
-            @test snap.rho[φ=2kk+1:2kk+2, θ=jj+1, r=ii-3] == [p[1], p[1]]
-            @test snap.bfield[φ=2kk+2, θ=jj+1, r=ii-3] ≈ J(70 + ii, jj)*p[SVector(7, 8, 9)] rtol = 1e-6
+            @test map(c -> c.ρ, snap.fluid[φ=2kk+1:2kk+2, θ=jj+1, r=ii-3]) == [p[1], p[1]]
+            @test snap.fluid[φ=2kk+2, θ=jj+1, r=ii-3].B ≈ J(70 + ii, jj)*p[SVector(7, 8, 9)] rtol = 1e-6
         end
 
         # caps: an output cell is the mean of the stored cells it covers; the other directions stay at level 1
         sφ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (φ = 0,))
-        @test size(sφ.rho) == (96, 192, 3) && sφ.φ0 ≈ π/96 && sφ.dφ ≈ 2π/96
+        @test size(sφ.fluid) == (96, 192, 3) && sφ.φ0 ≈ π/96 && sφ.dφ ≈ 2π/96
         @test sφ.r_prof == snap.r_prof && sφ.th_grid == snap.th_grid
         for ii in 4:6, jj in (0, 15), m in (0, 11)
             p, q = raw(6, ii, jj, 2m), raw(6, ii, jj, 2m + 1); i, j = 70 + ii, 16 + jj
-            @test sφ.rho[φ=12+m+1, θ=j+1, r=i-73] ≈ (p[1] + q[1])/2 rtol = 1e-6
-            @test sφ.velrel[φ=12+m+1, θ=j+1, r=i-73] ≈ (ũ(i, j, p) + ũ(i, j, q))/2 rtol = 1e-6
-            @test sφ.bfield[φ=12+m+1, θ=j+1, r=i-73] ≈ J(i, j)*(p[SVector(7, 8, 9)] + q[SVector(7, 8, 9)])/2 rtol = 1e-6
+            @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
+            @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ũ ≈ (ũ(i, j, p) + ũ(i, j, q))/2 rtol = 1e-6
+            @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].B ≈ J(i, j)*(p[SVector(7, 8, 9)] + q[SVector(7, 8, 9)])/2 rtol = 1e-6
         end
         for ii in 4:6, jj in (0, 9), kk in (0, 23)     # block 24989 is already at φ level 0: copied
-            @test sφ.rho[φ=kk+1, θ=jj+1, r=ii-3] == raw(8, ii, jj, kk)[1]
+            @test sφ.fluid[φ=kk+1, θ=jj+1, r=ii-3].ρ == raw(8, ii, jj, kk)[1]
         end
+        # partial, averaged: the requested fields in the order (ρ, ũ, B), the same data
+        sφp = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (φ = 0,), fields = (:B, :ũ))
+        @test eltype(sφp.fluid) == @NamedTuple{ũ::SVector{3,Float32}, B::SVector{3,Float32}}
+        @test sφp.fluid == map(c -> (; c.ũ, c.B), sφ.fluid)
+        @test_throws ArgumentError load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = ())
 
         # level-0 radial cell 37 = level-1 cells 74, 75 = block 25969's ii = 4, 5; each stored cell converted at its own r
         sr = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (r = 0, θ = nothing))
-        @test size(sr.rho) == (192, 192, 1) && sr.dφ == snap.dφ
+        @test size(sr.fluid) == (192, 192, 1) && sr.dφ == snap.dφ
         @test sr.r_prof ≈ [4.09400531115158] rtol = 1e-14
         @test sr.th_grid ≈ snap.th_grid[1:1, :] rtol = 1e-14
         for jj in (0, 15), kk in (0, 23)
             p, q = raw(6, 4, jj, kk), raw(6, 5, jj, kk); j, k = 16 + jj, 24 + kk
-            @test sr.rho[φ=k+1, θ=j+1, r=1] ≈ (p[1] + q[1])/2 rtol = 1e-6
-            @test sr.velrel[φ=k+1, θ=j+1, r=1] ≈ (ũ(74, j, p) + ũ(75, j, q))/2 rtol = 1e-6
-            @test sr.bfield[φ=k+1, θ=j+1, r=1] ≈ (J(74, j)*p[SVector(7, 8, 9)] + J(75, j)*q[SVector(7, 8, 9)])/2 rtol = 1e-6
+            @test sr.fluid[φ=k+1, θ=j+1, r=1].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
+            @test sr.fluid[φ=k+1, θ=j+1, r=1].ũ ≈ (ũ(74, j, p) + ũ(75, j, q))/2 rtol = 1e-6
+            @test sr.fluid[φ=k+1, θ=j+1, r=1].B ≈ (J(74, j)*p[SVector(7, 8, 9)] + J(75, j)*q[SVector(7, 8, 9)])/2 rtol = 1e-6
         end
 
         # level-0 θ cell m = level-1 cells 2m, 2m+1 = block 25969's jj = 2m-16, 2m-15
-        sθ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:rho,))
-        @test size(sθ.rho) == (192, 96, 3) && sθ.velrel === nothing && sθ.bfield === nothing
+        sθ = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:ρ,))
+        @test size(sθ.fluid) == (192, 96, 3) && eltype(sθ.fluid) == @NamedTuple{ρ::Float32}
         @test sθ.r_prof == snap.r_prof && sθ.dφ == snap.dφ
         @test sθ.th_grid ≈ [π/2*(1 - 0.9895833333333334 + (j + 1/2)*2h2) for i in 1:3, j in 0:95] rtol = 1e-14
         for ii in 4:6, m in (8, 15), kk in (0, 23)
-            @test sθ.rho[φ=24+kk+1, θ=m+1, r=ii-3] ≈ (raw(6, ii, 2m-16, kk)[1] + raw(6, ii, 2m-15, kk)[1])/2 rtol = 1e-6
+            @test sθ.fluid[φ=24+kk+1, θ=m+1, r=ii-3].ρ ≈ (raw(6, ii, 2m-16, kk)[1] + raw(6, ii, 2m-15, kk)[1])/2 rtol = 1e-6
         end
 
         # the output level comes from the blocks whose radial extent overlaps the range: below the edge r = 3.7751… of the
         # ring with levels up to (1, 1, 1), the inner ring's (0, 0, 1); rmax exactly at the edge already raises it
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.77, fields = (:rho,)).rho) == (192, 96, 1)
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.7751454194494656, fields = (:rho,)).rho) == (192, 192, 3)
-        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.81, fields = (:rho,)).rho) == (192, 192, 4)
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.77, fields = (:ρ,)).fluid) == (192, 96, 1)
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.7751454194494656, fields = (:ρ,)).fluid) == (192, 192, 3)
+        @test size(load_hamr(dir; rcyl = nothing, rmin = 3.6, rmax = 3.81, fields = (:ρ,)).fluid) == (192, 192, 4)
 
         # auto-detection without any grid argument; units independently optional
         @test snapshot_format(dir) === :hamr
-        @test load_snapshot(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = (:rho,)).rho == snap.rho
-        snapb = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.1, fields = (:rho,), MBH = 6.5e9)
+        @test load_snapshot(dir; rcyl = nothing, rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid == map(c -> (; c.ρ), snap.fluid)
+        snapb = load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
         @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
