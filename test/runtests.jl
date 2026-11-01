@@ -18,6 +18,7 @@ using TestItemRunner
     @test size(snap.velrel) == (24, 32, 48)
     @test size(snap.bfield) == (24, 32, 48)
     @test r_min(snap) < r_max(snap)
+    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
     @test all(>(0), diff(snap.r_prof))
 
     ρ, ũ, B = @inferred sample(snap, 5.0, 0.0, 0.0)
@@ -68,6 +69,7 @@ end
     @test snap2.rho == snap.rho
     @test snap2.velrel == snap.velrel
     @test snap2.bfield == snap.bfield
+    @test snap2.r_extent === snap.r_extent
 end
 
 @testitem "raw .h5 cross-check (optional, isfile-guarded)" begin
@@ -83,6 +85,7 @@ end
         @test s_mem.bfield == s_mm.bfield
 
         @test r_min(s_mem) < r_max(s_mem)
+        @test (r_min(s_mem), r_max(s_mem)) == (r_min(s_mm), r_max(s_mm)) == (s_mem.r_prof[1], s_mem.r_prof[end])
         @test all(>(0), diff(s_mem.r_prof))
         ρ, ũ, B = sample(s_mem, 5.0, 0.0, 0.0)
         @test isfinite(ρ) && all(isfinite, ũ) && all(isfinite, B)
@@ -393,6 +396,7 @@ end
     @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
     @test (@set snapbm.M_unit = missing).M_unit === missing
 
+    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
     c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
     for i in 1:n1, j in 1:n2, k in 1:n3
         X1 = sx1 + (i-0.5)*dx1; X2 = sx2 + (j-0.5)*dx2
@@ -564,6 +568,8 @@ end
     @test snap.φ0 ≈ π/16 && snap.dφ ≈ 2π/16
     @test snap.M_unit === missing && snap.MBH === missing
     @test snap.r_prof ≈ exp.(X1.(0:n1-1))
+    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
+    @test [r_min(snap), r_max(snap)] ≈ [exp(X1(0)), exp(X1(n1-1))]
     @test snap.th_grid ≈ [last(rθ(i, j)) for i in 0:n1-1, j in 0:n2-1]
 
     # ρ: finest row (θ row 1) copied as-is; coarse rows are periodic piecewise-linear "sawtooths" through the
@@ -599,6 +605,7 @@ end
     # radial subset across a block boundary: global cells 3..5, only rho
     sub = load_hamr(dir; rcyl, rmin = exp(X1(3)) - 1e-9, rmax = exp(X1(5)) + 1e-9, fields = (:rho,))
     @test sub.r_prof == snap.r_prof[4:6] && sub.th_grid == snap.th_grid[4:6, :]
+    @test (r_min(sub), r_max(sub)) == (snap.r_prof[4], snap.r_prof[6])
     @test sub.rho == snap.rho[r=4:6]
     @test sub.velrel === nothing && sub.bfield === nothing
     @test load_hamr(dir; rcyl, rmin = exp(X1(6)) - 1e-9).rho == snap.rho[r=7:8]

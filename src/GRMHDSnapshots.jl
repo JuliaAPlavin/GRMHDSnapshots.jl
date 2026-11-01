@@ -2,6 +2,7 @@ module GRMHDSnapshots
 
 using HDF5
 using StaticArrays
+using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
 using DataManipulation: mapview, filtermap, flatmap
@@ -22,11 +23,13 @@ include("coordinates.jl")
 # type parameter (`Um`, `Ub`): a number when known, `Missing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
 # H-AMR) store neither, and each can be supplied independently.
 # The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
-struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, Um, Ub}
+# `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
+struct GRMHDSnapshot{Ar, Av, Ab, Rp, Re, Tg, T, Um, Ub}
     rho::Ar
     velrel::Av
     bfield::Ab
     r_prof::Rp
+    r_extent::Re
     th_grid::Tg
     φ0::T
     dφ::T
@@ -123,7 +126,7 @@ function load_koral_h5(path::AbstractString; mmap=false)
         φ0 = φ0_file + π
 
         rdscalar(name) = Float64(read(h5[name]))
-        GRMHDSnapshot(rho, velrel, bfield, r_prof, th_grid, φ0, dφ,
+        GRMHDSnapshot(rho, velrel, bfield, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ,
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
             rdscalar("header/units/M_unit"), rdscalar("header/units/M_bh"))
     end
@@ -182,7 +185,7 @@ function load_koral(store::ZGroup, snapname::AbstractString;
 
     sc(x) = Float64(x)
     hdr = store.attrs; units = hdr["units"]
-    GRMHDSnapshot(rho, velrel, bfield, grid.r_prof, grid.th_grid, grid.φ0, grid.dφ,
+    GRMHDSnapshot(rho, velrel, bfield, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
         sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
         sc(units["M_unit"]), sc(units["M_bh"]))
 end
@@ -239,7 +242,7 @@ function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_u
 
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
         # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-        GRMHDSnapshot(rho, velrel, bfield, r_prof, th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
+        GRMHDSnapshot(rho, velrel, bfield, r_prof, first(r_prof)..last(r_prof), th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
             sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
     end
 end
@@ -318,7 +321,7 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing,
     nd(A) = isnothing(A) ? nothing : NamedDimsArray(A, (:φ, :θ, :r))
     dφ = dx[3]/2^lmax
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-    GRMHDSnapshot(nd(rho), nd(velrel), nd(bfield), r_prof, th_grid, startx[3] + dφ/2, dφ,
+    GRMHDSnapshot(nd(rho), nd(velrel), nd(bfield), r_prof, first(r_prof)..last(r_prof), th_grid, startx[3] + dφ/2, dφ,
         par.a, par.gam, par.t, M_unit, MBH)
 end
 
@@ -447,7 +450,7 @@ Minimum radial grid coordinate.
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_min(s::GRMHDSnapshot) = @inbounds s.r_prof[1]
+r_min(s::GRMHDSnapshot) = leftendpoint(s.r_extent)
 
 """
     r_max(snapshot)
@@ -457,7 +460,7 @@ Maximum radial grid coordinate.
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_max(s::GRMHDSnapshot) = @inbounds s.r_prof[end]
+r_max(s::GRMHDSnapshot) = rightendpoint(s.r_extent)
 
 # GPU-safe searchsortedlast.
 @inline function bsearchlast(a, x)
@@ -556,7 +559,7 @@ include("physics.jl")
 
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
     Adapt.adapt(to, s.rho), Adapt.adapt(to, s.velrel), Adapt.adapt(to, s.bfield),
-    Adapt.adapt(to, s.r_prof), Adapt.adapt(to, s.th_grid),
+    Adapt.adapt(to, s.r_prof), s.r_extent, Adapt.adapt(to, s.th_grid),
     s.φ0, s.dφ, s.spin, s.gam, s.t, s.M_unit, s.MBH)
 
 end
