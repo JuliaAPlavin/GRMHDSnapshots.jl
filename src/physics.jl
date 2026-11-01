@@ -1,12 +1,16 @@
-# Frame-invariant plasma-physics quantities in Kerr-Schild coordinates (G=c=M=1). The dump stores, per
-# cell, the HARM/Gammie relative 4-velocity ũ^i and the lab-frame 3-field B^i as KS components; from
-# these we reconstruct the plasma 4-velocity u^μ and comoving field b^μ (matching ipole's
-# load_koral_data / get_model_fourv). Everything here is emission-agnostic and coordinate-frame-invariant.
+# Frame-invariant plasma-physics quantities in Kerr-Schild coordinates (G=c=M=1). The dump stores, per cell, the
+# HARM/Gammie relative 4-velocity ũ^i and the lab-frame 3-field B^i as KS components of the grid's spherical coordinates;
+# the grid maps work in the spin frame's, where the metric is Kerr-Schild. From these we reconstruct the plasma 4-velocity
+# u^μ and comoving field b^μ (matching ipole's load_koral_data / get_model_fourv). Everything here is emission-agnostic
+# and coordinate-frame-invariant.
 
 # Kerr-Schild metric g_{μν}, coordinates (t,r,θ,φ). Type-generic (zero(r)/one(r)) so the SMatrix stays in
 # the working precision — no Float64 literals leak in.
-@inline function ks_gcov(r, θ, a)
-    s2 = sin(θ)^2; ρ2 = r^2 + a^2*cos(θ)^2; tr = 2r/ρ2; z = zero(r); o = one(r)
+@inline ks_gcov(r, θ, a) = _ks_gcov_sq(r, cos(θ)^2, sin(θ)^2, a)
+
+# The same from c2 = cos²θ and s2 = sin²θ: a turned cell has them from its spin-frame unit vector, without θ.
+@inline function _ks_gcov_sq(r, c2, s2, a)
+    ρ2 = r^2 + a^2*c2; tr = 2r/ρ2; z = zero(r); o = one(r)
     @SMatrix [ -o+tr      tr           z   -a*s2*tr ;
                 tr        o+tr         z   -a*s2*(o+tr) ;
                 z         z            ρ2  z ;
@@ -16,8 +20,9 @@ end
 # Spatial-metric norm √(γᵢⱼVⁱVʲ) of a contravariant 3-vector in KS (γ = spatial part of ks_gcov): the
 # proper coordinate-invariant magnitude of V^i — a raw Euclidean component norm instead mixes the
 # radial (per-length) and angular (per-radian) parts and is not a real magnitude.
-@inline function spatial_norm(V::SVector{3}, r, θ, a)
-    γ = ks_gcov(r, θ, a)[SVector(2, 3, 4), SVector(2, 3, 4)]
+@inline spatial_norm(V::SVector{3}, r, θ, a) = _spatial_norm(V, ks_gcov(r, θ, a))
+@inline function _spatial_norm(V::SVector{3}, g::SMatrix{4,4})
+    γ = g[SVector(2, 3, 4), SVector(2, 3, 4)]
     sqrt(V'*γ*V)
 end
 
@@ -62,8 +67,9 @@ Coordinate 3-velocity `v^i = u^i/u^t = dx^i/dt` (KS components) of the fluid: sa
 flow, magnitude the coordinate speed (bounded, unlike the 4-velocity's proper-time components). The
 grid method maps it over a snapshot, `(:φ,:θ,:r)`.
 """
-@inline function fluid_velocity(ũ::SVector{3}, r, θ, a)
-    u = fluid_ucon(ũ, r, θ, a)
+@inline fluid_velocity(ũ::SVector{3}, r, θ, a) = _fluid_velocity(ũ, ks_gcov(r, θ, a))
+@inline function _fluid_velocity(ũ::SVector{3}, g::SMatrix{4,4})
+    u = gammie_ucon(ũ, g)
     SVector(u[2], u[3], u[4]) / u[1]
 end
 
@@ -76,7 +82,8 @@ Physical 3-speed of the fluid relative to the local normal (Eulerian) observer, 
 raw coordinate-component norm. No subtraction of nearly equal numbers, unlike `√(1 − 1/γ²)` for slow
 flows. The grid method maps it over a snapshot, `(:φ,:θ,:r)`.
 """
-@inline flow_speed(ũ::SVector{3}, r, θ, a) = (βγ = proper_velocity(ũ, r, θ, a); βγ/√(1 + βγ^2))
+@inline flow_speed(ũ::SVector{3}, r, θ, a) = _flow_speed(ũ, ks_gcov(r, θ, a))
+@inline _flow_speed(ũ::SVector{3}, g::SMatrix{4,4}) = (βγ = _spatial_norm(ũ, g); βγ/√(1 + βγ^2))
 
 """
     proper_velocity(ũ, r, θ, a)
@@ -125,7 +132,8 @@ Normal-(Eulerian-)observer lapse α = 1/√(−gᵗᵗ) = 1/√(1 + 2r/(r²+a²c
 `a`: the normal observer's proper-time-per-coordinate-time. NOT the photon redshift — that is
 [`grav_redshift`](@ref) (they differ, even in Schwarzschild). Type-generic; α → 1 as r → ∞, α ∈ (0,1].
 """
-@inline lapse(r, θ, a) = 1/√(1 + 2r/(r^2 + a^2*cos(θ)^2))
+@inline lapse(r, θ, a) = _lapse(r, cos(θ)^2, a)
+@inline _lapse(r, c2, a) = 1/√(1 + 2r/(r^2 + a^2*c2))      # c2 = cos²θ
 
 """
     grav_redshift(r, θ, a)
@@ -146,7 +154,8 @@ Ratio of proper 3-volume to Euclidean coordinate volume at KS `(r, θ)` with spi
 Multiplying a per-proper-volume density by this gives a per-displayed-(Cartesian-)volume density, so
 its integral over the drawn `dx dy dz` box is metric-correct. → 1 as r → ∞; > 1 near the BH.
 """
-@inline volume_ratio(r, θ, a) = (r^2 + a^2*cos(θ)^2)/(r^2*lapse(r, θ, a))
+@inline volume_ratio(r, θ, a) = _volume_ratio(r, cos(θ)^2, a)
+@inline _volume_ratio(r, c2, a) = (ρ2 = r^2 + a^2*c2; √(ρ2*(ρ2 + 2r))/r^2)   # c2 = cos²θ; = ρ2/(r²α) with one sqrt
 
 """
     ks_to_bl(v, r, θ, a)
@@ -193,43 +202,59 @@ Code field unit c·√(4π·ρ_unit) in Gauss. Needs both `M_unit` and `MBH`.
 """
 bunit(snap::GRMHDSnapshot) = (_require_units(snap, :bunit, :M_unit, :MBH); ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap)))
 
-# ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.fluid. For cell (φ=k,θ=j,r=i): coords r_prof[i],
-# th_grid[i,j]; fluid record fluid[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──
+# ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.fluid. For cell (φ=k,θ=j,r=i): grid coords r_prof[i], th_grid[i,j],
+# φ0 + (k−1)·dφ; fluid record fluid[φ=k,θ=j,r=i]. Results are in the spin frame: vectors in its components, the metric
+# at the cell's spin-frame colatitude θ′. ──
+
+# f(cell, fr) at every cell, as a `(:φ,:θ,:r)` array: the cell's fluid record (grid components) and its spin-frame geometry
+# fr = (; r, n, eθ, eφs) for `_tospin` and `_ks_gcov`. `f` converts only the fields it reads, so unread ones cost nothing
+# and a partially loaded snapshot works. `foreach_r` runs over the radial slabs (`foreach` or `tforeach`).
+function _map_cells(f, snap::GRMHDSnapshot, foreach_r)
+    (; fluid, r_prof, th_grid, φ0, dφ) = snap
+    A = parent(fluid)
+    R = _rotation(snap.R); z = R[:, 3]
+    # per φ column (center as in `_sample_stencil`): the spin-frame directions of the grid's x̂ cosφ + ŷ sinφ and φ̂
+    cols = map(axes(A, 1)) do k
+        sφ, cφ = sincos(φ0 + (k - 1)*dφ)
+        (u = R*SVector(cφ, sφ, zero(cφ)), v = R*SVector(-sφ, cφ, zero(cφ)))
+    end
+    # inlined into the loop: a call per cell costs more than the cell's own work
+    @inline cell(k, j, i, sθ, cθ) = @inbounds let (; u, v) = cols[k]
+        @inline f(A[k, j, i], (r = r_prof[i], n = sθ*u + cθ*z, eθ = cθ*u - sθ*z, eφs = sθ*v))
+    end
+    out = Array{typeof(cell(1, 1, 1, sincos(th_grid[1, 1])...))}(undef, size(A))
+    foreach_r(i -> _fill_slab!(out, cell, i, view(th_grid, i, :)), axes(A, 3))
+    NamedDimsArray(out, (:φ, :θ, :r))
+end
+
+# Radial slab `i` of `out`: sincos of each grid θ once, then every cell.
+function _fill_slab!(out, cell, i, ths)
+    @inbounds for j in axes(out, 2)
+        sθ, cθ = sincos(ths[j])
+        for k in axes(out, 1)
+            out[k, j, i] = cell(k, j, i, sθ, cθ)
+        end
+    end
+end
+
+# Kerr-Schild metric at the spin-frame point of geometry `fr`.
+@inline _ks_gcov(fr, a) = _ks_gcov_sq(fr.r, fr.n[3]^2, fr.n[1]^2 + fr.n[2]^2, a)
 
 """
     map_plasma(f, snap; threaded=true)
 
 Map a kernel `f(ps, g, cell)` over the whole grid, returning a `(:φ,:θ,:r)` array. `ps` is the
 [`plasma_state`](@ref) named tuple `(u, b, bsq)` and `g` the per-cell [`grav_redshift`](@ref) √(−g_tt)
-— both reconstructed from `cell.ũ`/`cell.B` and the metric — and `cell` is the cell's fluid record, so
-`ρ` need not be loaded unless `f` reads `cell.ρ`. The Kerr-Schild metric (and hence `ps` and `g`)
-depends only on `(r,θ)`, so it is built once per `(r,θ)` slab and reused across all φ. The outer radial
-loop runs over `OhMyThreads.tmap` (`threaded`) or `map`.
+— both reconstructed from `cell.ũ`/`cell.B` and the metric — and `cell` is the cell's fluid record with its vectors in
+spin-frame components, so `ρ` need not be loaded unless `f` reads `cell.ρ`. The outer radial loop runs over
+`OhMyThreads.tforeach` (`threaded`) or `foreach`.
 """
-function map_plasma(f, snap::GRMHDSnapshot; threaded::Bool = true)
-    rr = 1:size(snap.fluid, :r)
-    slab(i) = _plasma_slab(f, snap, i)      # function barrier → concrete slab element type
-    slabs = threaded ? tmap(slab, rr) : map(slab, rr)
-    NamedDimsArray(stack(slabs), (:φ, :θ, :r))
-end
-
-# One (φ,θ) slab at radial index `i`. The (r,θ)-only metric g and redshift zg are built once per θ and
-# reused across φ. NamedDims keyword indexing is zero-cost. `f` is a proper argument → this specializes on it.
-function _plasma_slab(f, snap::GRMHDSnapshot, i)
-    (; fluid, r_prof, th_grid, spin) = snap
-    nφ, nθ = size(fluid, :φ), size(fluid, :θ)
-    r = r_prof[i]
-    cell(k, j, g, zg) = (c = fluid[φ=k, θ=j, r=i]; f(_plasma_state(c.ũ, c.B, g), zg, c))
-    g1 = ks_gcov(r, th_grid[i, 1], spin)
-    out = Matrix{typeof(cell(1, 1, g1, _grav_redshift(g1)))}(undef, nφ, nθ)
-    @inbounds for j in 1:nθ
-        g = ks_gcov(r, th_grid[i, j], spin); zg = _grav_redshift(g)
-        for k in 1:nφ
-            out[k, j] = cell(k, j, g, zg)
-        end
+map_plasma(f, snap::GRMHDSnapshot; threaded::Bool = true) =
+    _map_cells(snap, threaded ? tforeach : foreach) do c, fr
+        ũ, B = _tospin(c.ũ, fr), _tospin(c.B, fr)
+        g = _ks_gcov(fr, snap.spin)
+        f(_plasma_state(ũ, B, g), _grav_redshift(g), merge(c, (; ũ, B)))
     end
-    out
-end
 
 """
     comoving_bsq(snap)
@@ -238,36 +263,26 @@ Per-cell invariant b·b [code units], as a `(:φ,:θ,:r)` array.
 """
 comoving_bsq(snap::GRMHDSnapshot) = map_plasma((ps, _, _) -> ps.bsq, snap)
 
-# Map a per-cell kernel `f(cell, r, θ, a)` of the fluid record + coords over the grid. Unlike `map_plasma`
-# it needs only the fields `f` reads, so it works on a partially-loaded snapshot.
-function _grid_map1(f, snap::GRMHDSnapshot)
-    (; fluid, r_prof, th_grid, spin) = snap
-    nφ, nθ, nr = size(fluid)
-    NamedDimsArray(
-        [f(fluid[φ=k, θ=j, r=i], r_prof[i], th_grid[i, j], spin) for k in 1:nφ, j in 1:nθ, i in 1:nr],
-        (:φ, :θ, :r))
-end
-
 """
     fluid_velocity(snap)
 
 Per-cell coordinate 3-velocity `v^i` [code units], as a `(:φ,:θ,:r)` array.
 """
-fluid_velocity(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> fluid_velocity(c.ũ, r, θ, a), snap)
+fluid_velocity(snap::GRMHDSnapshot) = _map_cells((c, fr) -> _fluid_velocity(_tospin(c.ũ, fr), _ks_gcov(fr, snap.spin)), snap, foreach)
 
 """
     flow_speed(snap)
 
 Per-cell physical speed `v/c` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-flow_speed(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> flow_speed(c.ũ, r, θ, a), snap)
+flow_speed(snap::GRMHDSnapshot) = _map_cells((c, fr) -> _flow_speed(_tospin(c.ũ, fr), _ks_gcov(fr, snap.spin)), snap, foreach)
 
 """
     proper_velocity(snap)
 
 Per-cell proper velocity `βγ = √(γ²−1)` relative to the normal observer, as a `(:φ,:θ,:r)` array.
 """
-proper_velocity(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> proper_velocity(c.ũ, r, θ, a), snap)
+proper_velocity(snap::GRMHDSnapshot) = _map_cells((c, fr) -> _spatial_norm(_tospin(c.ũ, fr), _ks_gcov(fr, snap.spin)), snap, foreach)
 
 """
     bfield_magnitude(snap)
@@ -275,7 +290,7 @@ proper_velocity(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> proper_veloci
 Normal-frame magnitude of the lab 3-field `B^i`, `√(γᵢⱼBⁱBʲ)` [code units], as a `(:φ,:θ,:r)` array —
 the proper spatial-metric norm, not a raw component norm.
 """
-bfield_magnitude(snap::GRMHDSnapshot) = _grid_map1((c, r, θ, a) -> spatial_norm(c.B, r, θ, a), snap)
+bfield_magnitude(snap::GRMHDSnapshot) = _map_cells((c, fr) -> _spatial_norm(_tospin(c.B, fr), _ks_gcov(fr, snap.spin)), snap, foreach)
 
 """
     comoving_B_gauss(snap)
@@ -291,28 +306,23 @@ Per-cell magnetization σ = b²/ρ [code units], as a `(:φ,:θ,:r)` array. ρ=0
 """
 magnetization(snap::GRMHDSnapshot) = map_plasma((ps, _, c) -> ps.bsq/c.ρ, snap)
 
-# Replicate a φ-invariant (r,θ) field over φ into a `(:φ,:θ,:r)` array (downstream texture consistency).
-function _phi_replicate(m, nφ)
-    NamedDimsArray([m[i, j] for k in 1:nφ, j in axes(m, 2), i in axes(m, 1)], (:φ, :θ, :r))
-end
-
 """
     lapse(snap)
 
-Per-cell lapse α, as a `(:φ,:θ,:r)` array (φ-invariant).
+Per-cell lapse α, as a `(:φ,:θ,:r)` array.
 """
-lapse(snap::GRMHDSnapshot) = _phi_replicate(lapse.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))
+lapse(snap::GRMHDSnapshot) = _map_cells((_, fr) -> _lapse(fr.r, fr.n[3]^2, snap.spin), snap, foreach)
 
 """
     grav_redshift(snap)
 
-Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array (φ-invariant).
+Per-cell gravitational redshift g = √(−g_tt), as a `(:φ,:θ,:r)` array.
 """
-grav_redshift(snap::GRMHDSnapshot) = _phi_replicate(grav_redshift.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))
+grav_redshift(snap::GRMHDSnapshot) = _map_cells((_, fr) -> _grav_redshift(_ks_gcov(fr, snap.spin)), snap, foreach)
 
 """
     volume_ratio(snap)
 
-Per-cell proper-to-coordinate volume ratio √γ/(r²sinθ), as a `(:φ,:θ,:r)` array (φ-invariant).
+Per-cell proper-to-coordinate volume ratio √γ/(r²sinθ), as a `(:φ,:θ,:r)` array.
 """
-volume_ratio(snap::GRMHDSnapshot) = _phi_replicate(volume_ratio.(snap.r_prof, snap.th_grid, snap.spin), size(snap.fluid, :φ))
+volume_ratio(snap::GRMHDSnapshot) = _map_cells((_, fr) -> _volume_ratio(fr.r, fr.n[3]^2, snap.spin), snap, foreach)

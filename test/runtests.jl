@@ -30,6 +30,8 @@ using TestItemRunner
     rn = snap.r_prof[i]; θn = snap.th_grid[i, j]; φn = snap.φ0 + (k - 1) * snap.dφ
     xn = rn * sin(θn) * cos(φn); yn = rn * sin(θn) * sin(φn); zn = rn * cos(θn)
     @test sample(snap, xn, yn, zn).ρ ≈ snap.fluid[φ=k, θ=j, r=i].ρ
+    @test sample(snap, xn, yn, zn).ũ ≈ snap.fluid[φ=k, θ=j, r=i].ũ rtol = 1e-11
+    @test sample(snap, xn, yn, zn).B ≈ snap.fluid[φ=k, θ=j, r=i].B rtol = 1e-11
 
     rec0 = @inferred sample(snap, 0.0, 0.0, 10 * r_max(snap))
     @test rec0 === (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))
@@ -119,7 +121,7 @@ end
 @testitem "plasma physics" begin
     using StaticArrays, Zarr, NamedDims, Accessors
     using LinearAlgebra: det
-    using GRMHDSnapshots: plasma_state, ks_gcov
+    using GRMHDSnapshots: plasma_state, ks_gcov, spatial_norm
 
     store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
     snap = load_koral(store, "snap002000")
@@ -205,18 +207,27 @@ end
     @test bfield_magnitude(snap_b) == bfield_magnitude(snap)
     @test lapse(snap_b) == lapse(snap)
 
-    # lapse(snap) is φ-invariant and equals the scalar lapse at each (r,θ), exactly.
-    @test lap == [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    # lapse(snap) equals the scalar lapse at each cell's (r,θ).
+    @test lap ≈ [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
 
-    # grav_redshift(snap) is φ-invariant and equals the scalar grav_redshift at each (r,θ), exactly.
+    # grav_redshift(snap) equals the scalar grav_redshift at each cell's (r,θ).
     zg = grav_redshift(snap)
     @test size(zg) == size(snap.fluid) && all(x -> 0 ≤ x ≤ 1, zg)
-    @test zg == [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    @test zg ≈ [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
 
-    # volume_ratio(snap) is φ-invariant, equals the scalar at each (r,θ), and is ≥ 1 everywhere.
+    # volume_ratio(snap) equals the scalar at each cell's (r,θ), and is ≥ 1 everywhere.
     vr = volume_ratio(snap)
     @test size(vr) == size(snap.fluid) && all(≥(1), vr)
-    @test vr == [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    @test vr ≈ [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
+
+    # the vector-field maps and map_plasma's record equal the per-cell scalar functions at each cell's (r, θ)
+    percell(f) = [f(snap.fluid[φ=k, θ=j, r=i], snap.r_prof[i], snap.th_grid[i, j]) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    @test flow_speed(snap) ≈ percell((c, r, θ) -> flow_speed(c.ũ, r, θ, a)) rtol = 1e-13
+    @test proper_velocity(snap) ≈ percell((c, r, θ) -> proper_velocity(c.ũ, r, θ, a)) rtol = 1e-13
+    @test fluid_velocity(snap) ≈ percell((c, r, θ) -> fluid_velocity(c.ũ, r, θ, a)) rtol = 1e-13
+    @test bfield_magnitude(snap) ≈ percell((c, r, θ) -> spatial_norm(c.B, r, θ, a)) rtol = 1e-13
+    @test map_plasma((_, _, c) -> c.ũ, snap) ≈ map(c -> c.ũ, snap.fluid) rtol = 1e-13
+    @test map_plasma((_, _, c) -> c.B, snap) ≈ map(c -> c.B, snap.fluid) rtol = 1e-13
 
     # Unit scalars are plain CGS Float64; koral stores M_bh = 6.5e9 M☉.
     unitsof(s) = map(f -> f(s), [lunit, rhounit, bunit])
@@ -233,6 +244,133 @@ end
 
     # Kernel type stability on Float64 inputs.
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
+end
+
+@testitem "spin frame turned relative to the grid" begin
+    using StaticArrays, Zarr, NamedDims, Accessors
+    using LinearAlgebra: norm, dot, normalize, det
+    using GRMHDSnapshots: sample, plasma_state, spatial_norm, _apply_stencil, _sample_stencil
+
+    # rotations R (grid Cartesian → spin frame): Rx takes grid −x to +z; a cyclic permutation; a half turn about z
+    Rx = SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0)
+    Ms = (Rx, SMatrix{3,3,Int}(0, 1, 0, 0, 0, 1, 1, 0, 0), SMatrix{3,3,Int}(-1, 0, 0, 0, -1, 0, 0, 0, 1))
+    I3 = one(SMatrix{3,3,Int})
+    @test all(M -> M'*M == I3 && det(M) == 1, Ms)
+
+    # independent reference: spherical basis by trig, Cartesian vector of (V^r, V^θ, V^φ) at p, with φ given on the z axis
+    function cart(V, p, φ = atan(p[2], p[1]))
+        r = norm(p); θ = acos(clamp(p[3]/r, -1, 1))
+        V[1]*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)) + V[2]*r*SVector(cos(θ)*cos(φ), cos(θ)*sin(φ), -sin(θ)) +
+            V[3]*r*sin(θ)*SVector(-sin(φ), cos(φ), 0)
+    end
+    # the interpolated grid record at grid point q, unconverted
+    raw(snap, q) = _apply_stencil(_sample_stencil(snap, size(snap.fluid, :φ), q...), snap.fluid)
+
+    koral = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
+    # each snapshot with in-grid radii
+    dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
+    hamr = if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
+        ((load_hamr(dir; rcyl = nothing, rmin = 4, rmax = 4.2), (4.07, 4.13, 4.19)),)
+    else
+        @test_skip "H-AMR new-layout dump dir or gdumps absent"
+        ()
+    end
+    snaps = ((koral, (5.0, 12.0, 40.0)), hamr...)
+    dirs = normalize.([SVector(0.3, -0.5, 0.8), SVector(-0.7, 0.2, -0.4), SVector(0.1, 0.9, 0.35), SVector(-0.6, -0.6, 0.5)])
+
+    for (snap, rs) in snaps, M in Ms
+        snapR = @set snap.R = Val(M)
+        a = snap.spin
+        RT = typeof(sample(snap, (rs[1]*dirs[1])...))
+
+        # a. covariance off both axes: same ρ, and the vectors are the grid ones turned by M
+        for r in rs, d in dirs
+            p = r*d; q = M'*p
+            s = @inferred sample(snapR, p...); s0 = sample(snap, q...)
+            @test s isa RT
+            @test s.ρ ≈ s0.ρ rtol = 1e-14
+            @test cart(s.ũ, p) ≈ M*cart(s0.ũ, q) rtol = 1e-12
+            @test cart(s.B, p) ≈ M*cart(s0.B, q) rtol = 1e-12
+        end
+        @test sample(snapR, 0.0, 0.0, 10*r_max(snap)) === sample(snapR, 0.1*r_min(snap), 0.0, 0.0) ===
+              sample(snapR, 0.0, 0.0, 0.0) === sample(snap, 0.0, 0.0, 10*r_max(snap))
+
+        # on the grid axis, off the spin axis: covariant against the grid basis at the lookup's φ = atan(q[2], q[1]),
+        # 0 or π by the sign of zero in q[1] (both occur among these points)
+        zc = M[:, 3]
+        if !iszero(zc[1]^2 + zc[2]^2)
+            onq = vec([SVector(ntuple(i -> iszero(zc[i]) ? sg[i]*0.0 : z*zc[i], 3))
+                       for sg in Iterators.product((1, -1), (1, -1), (1, -1)), z in (rs[2], -rs[2])])
+            @test any(p -> signbit((M'*p)[1]), onq) && any(p -> !signbit((M'*p)[1]), onq)
+            for p in onq
+                q = M'*p
+                s = sample(snapR, p...); w = raw(snap, q)
+                @test all(isfinite, s.ũ) && all(isfinite, s.B)
+                @test cart(s.ũ, p) ≈ M*cart(w.ũ, q) rtol = 1e-12
+                @test cart(s.B, p) ≈ M*cart(w.B, q) rtol = 1e-12
+            end
+        end
+
+        # c. grid maps at nodes against the scalar functions of the sampled spin-frame record at its colatitude θ′; at a node
+        # the interpolation weights are 0/1 up to rounding (of acos near the poles)
+        # nodes at φ < π: past it the lookup's atan wraps by 2π, while the grid's period nφ·dφ is 2π only to the precision
+        # of the stored φ. k = 1 is a node of the stencil across the wrap (k = nφ, 1).
+        nφ, nθ, nr = size(snap.fluid)
+        km = findlast(k -> snap.φ0 + (k - 1)*snap.dφ < π, 1:nφ)
+        ir = (2, nr - 1, nr ÷ 2)
+        cells = [(1, 1, ir[1]), (km, nθ, ir[2]), (km ÷ 2, 2, ir[3]), (1, nθ ÷ 2, ir[1]), (km, 1, ir[3]), (3, nθ - 1, ir[2])]
+        pts = map(cells) do (k, j, i)
+            r = snap.r_prof[i]; θ = snap.th_grid[i, j]; φ = snap.φ0 + (k - 1)*snap.dφ
+            p = M*(r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)))
+            (; r, θ′ = acos(p[3]/norm(p)), s = sample(snapR, p...))
+        end
+        at(A) = map(((k, j, i),) -> A[φ=k, θ=j, r=i], cells)
+        ps(x) = plasma_state(x.s.ũ, x.s.B, x.r, x.θ′, a)
+        mp = map_plasma((ps, g, c) -> (; ps.u, ps.b, g, c), snapR)
+        for (grid, scalar) in ((flow_speed(snapR), x -> flow_speed(x.s.ũ, x.r, x.θ′, a)),
+                               (proper_velocity(snapR), x -> proper_velocity(x.s.ũ, x.r, x.θ′, a)),
+                               (fluid_velocity(snapR), x -> fluid_velocity(x.s.ũ, x.r, x.θ′, a)),
+                               (bfield_magnitude(snapR), x -> spatial_norm(x.s.B, x.r, x.θ′, a)),
+                               (comoving_bsq(snapR), x -> ps(x).bsq),
+                               (map(m -> m.u, mp), x -> ps(x).u), (map(m -> m.b, mp), x -> ps(x).b),
+                               (map(m -> m.g, mp), x -> grav_redshift(x.r, x.θ′, a)),
+                               (map(m -> m.c.ρ, mp), x -> x.s.ρ), (map(m -> m.c.ũ, mp), x -> x.s.ũ), (map(m -> m.c.B, mp), x -> x.s.B),
+                               (lapse(snapR), x -> lapse(x.r, x.θ′, a)), (grav_redshift(snapR), x -> grav_redshift(x.r, x.θ′, a)),
+                               (volume_ratio(snapR), x -> volume_ratio(x.r, x.θ′, a)))
+            @test at(grid) ≈ map(scalar, pts) rtol = 1e-11
+        end
+    end
+
+    # b. on the spin axis: θ′ along φ′ = atan(p[2], p[1]), 0 or π by the sign of zero in p[1], so ê_θ′ = (±1, 0, 0); the φ′
+    # component is 0
+    for (snap, rs) in snaps, T in (Ms..., I3), z in (rs[2], -rs[2]), x0 in (0.0, -0.0)
+        sR = @set snap.R = Val(T)
+        p = SVector(x0, 0.0, z); q = T'*p
+        s = sample(sR, p...); w = raw(snap, q)
+        eθ = SVector(sign(z)*copysign(1, x0), 0, 0)
+        for (V, W) in ((s.ũ, w.ũ), (s.B, w.B))
+            @test all(isfinite, V)
+            @test V[3] == 0
+            @test V[1] == W[1]
+            @test V[2] ≈ dot(T*cart(W, q), eθ)/abs(z) rtol = 1e-12
+        end
+    end
+
+    # d. maps on partial snapshots with a turned R need only the fields they read; the same results as the full one
+    store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
+    part(fields) = @set load_koral(store, "snap002000"; fields).R = Val(Rx)
+    full = @set koral.R = Val(Rx)
+    sρ, sũ, sB = part((:ρ,)), part((:ũ,)), part((:B,))
+    @test lapse(sρ) == lapse(sB) == lapse(full)
+    @test grav_redshift(sρ) == grav_redshift(sũ) == grav_redshift(full)
+    @test volume_ratio(sρ) == volume_ratio(sB) == volume_ratio(full)
+    @test flow_speed(sũ) == flow_speed(full) && proper_velocity(sũ) == proper_velocity(full)
+    @test fluid_velocity(sũ) == fluid_velocity(full)
+    @test bfield_magnitude(sB) == bfield_magnitude(full)
+    @test comoving_bsq(part((:ũ, :B))) == comoving_bsq(full)
+    foreach(f -> @inferred(f(full)), (flow_speed, proper_velocity, fluid_velocity, bfield_magnitude, comoving_bsq,
+                                      lapse, grav_redshift, volume_ratio))
+    @inferred lapse(sρ)
 end
 
 @testitem "velocity direction: u^μ reconstruction & flow" begin

@@ -7,7 +7,7 @@ using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
 using DataManipulation: filtermap, flatmap, group
-using OhMyThreads: tmap, @tasks, @local, chunks
+using OhMyThreads: tmap, tforeach, @tasks, @local, chunks
 import StructArrays
 import ForwardDiff
 import Adapt
@@ -27,10 +27,11 @@ include("coordinates.jl")
 # The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
 # `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
 # `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
-# (lab field B^i), vectors in Kerr-Schild components; a partial load holds only the requested keys, in that order.
-# One interleaved record per cell: an interpolation reads each stencil corner from one place.
+# (lab field B^i), vectors in Kerr-Schild components of the grid's spherical coordinates; a partial load holds only the
+# requested keys, in that order. One interleaved record per cell: an interpolation reads each stencil corner from one place.
 # `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
 # point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
+# `sample` and the grid maps return vectors in spin-frame Kerr-Schild components.
 struct GRMHDSnapshot{F, Rp, Re, Tg, T, Rt, Um, Ub}
     fluid::F
     r_prof::Rp
@@ -623,25 +624,61 @@ _zero(::Type{T}) where {T<:NamedTuple} = T(map(_zero, fieldtypes(T)))
     _lerp(face(st.i, st.ji, st.tji), face(st.i + 1, st.jp, st.tjp), st.ti)
 end
 
+_rotation(::Val{M}) where {M} = M
+
+# (cos φ, sin φ) of p's azimuth and its cylindrical radius; on the z axis φ = atan(p[2], p[1]) ∈ {0, ±π} by the signs
+# of zero, as in `_sample_stencil`
+@inline function _azimuth(p)
+    ρ = sqrt(p[1]^2 + p[2]^2)
+    ρ > 0 ? (p[1]/ρ, p[2]/ρ, ρ) : (copysign(one(ρ), p[1]), zero(ρ), ρ)
+end
+
+# Grid vector components (r, θ, φ) → spin-frame ones at a point of spin-frame geometry `fr`: its unit direction n, and
+# eθ, eφs the spin-frame Cartesian vectors of the grid's ∂θ/r and ∂φ/r there. r is shared. On the spin axis θ′ is taken
+# along φ′ = atan(n[2], n[1]) ∈ {0, ±π} and the φ′ component, singular there, is 0. Scalars (ρ) are unchanged.
+@inline _tospin(x::Number, fr) = x
+@inline function _tospin(V::SVector{3}, fr)
+    (; n, eθ, eφs) = fr
+    w = V[2]*eθ + V[3]*eφs
+    s2 = n[1]^2 + n[2]^2
+    iszero(s2) && return SVector(V[1], n[3]*copysign(one(s2), n[1])*w[1], zero(s2))
+    is = 1/sqrt(s2)
+    SVector(V[1], (n[3]*(n[1]*w[1] + n[2]*w[2]) - s2*w[3])*is, (n[1]*w[2] - n[2]*w[1])*is^2)
+end
+
+# Geometry `(; r, n, eθ, eφs)` for `_tospin` at the spin-frame point p = R·q, from Cartesian coordinates (no trig: acos
+# loses accuracy near the axis)
+@inline function _sample_frame(R, p, q)
+    r = sqrt(q[1]^2 + q[2]^2 + q[3]^2)
+    c, s, ρ = _azimuth(q)
+    (; r, n = p/r, eθ = R*SVector(q[3]/r*c, q[3]/r*s, -ρ/r), eφs = R*SVector(-q[2], q[1], zero(r))/r)
+end
+
 """
     sample(snapshot, x, y, z)
 
-Trilinearly interpolate the fluid record at Cartesian position `(x, y, z)`, field by field.
+Trilinearly interpolate the fluid record at the spin-frame Cartesian position `(x, y, z)`, field by field.
 
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`, with any subset of the fluid fields.
-- `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
+- `x`, `y`, `z`: spin-frame Cartesian coordinates in gravitational radii.
 
 # Returns
-- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, in the grid precision (`eltype(snapshot.r_prof)`); zeros
-  outside the grid.
+- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, vectors in spin-frame Kerr-Schild components, in the
+  grid precision (`eltype(snapshot.r_prof)`); zeros outside the grid.
 """
 @inline function sample(s::GRMHDSnapshot, x, y, z)
     A = s.fluid
-    st = _sample_stencil(s, size(A, :φ), x, y, z)
+    R = _rotation(s.R)
+    p = SVector(x, y, z)
+    q = R'*p
+    st = _sample_stencil(s, size(A, :φ), q...)
     # `_lerp` with a weight promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
+    # Not converted: the frame is NaN at r = 0.
     z0 = _zero(eltype(A))
-    st === nothing ? _lerp(z0, z0, one(eltype(s.r_prof))) : _apply_stencil(st, A)
+    st === nothing && return _lerp(z0, z0, one(eltype(s.r_prof)))
+    fr = _sample_frame(R, p, q)
+    map(v -> _tospin(v, fr), _apply_stencil(st, A))
 end
 
 include("physics.jl")
