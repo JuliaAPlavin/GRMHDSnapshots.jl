@@ -59,7 +59,7 @@ end
 end
 
 @testitem "Adapt identity move preserves axis names & values" begin
-    using Adapt, AxisKeys, Zarr
+    using Adapt, NamedDims, Zarr
 
     snap = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
     snap2 = Adapt.adapt_structure(Array, snap)
@@ -103,7 +103,7 @@ end
 end
 
 @testitem "plasma physics" begin
-    using StaticArrays, Zarr, AxisKeys
+    using StaticArrays, Zarr, NamedDims
     using LinearAlgebra: det
     using GRMHDSnapshots: plasma_state, ks_gcov
 
@@ -335,7 +335,7 @@ end
 end
 
 @testitem "iharm FMKS loader: synthetic round-trip" begin
-    using HDF5, StaticArrays, AxisKeys
+    using HDF5, StaticArrays, NamedDims
     using GRMHDSnapshots: FMKS, bl_coord, jacobian_spatial, plasma_state, ks_gcov
 
     # Write a tiny valid FMKS dump and load it — exercises header parsing, prims unpacking, the grid
@@ -380,7 +380,7 @@ end
 end
 
 @testitem "iharm FMKS loader: real data + pyharm golden (optional, isfile-guarded)" begin
-    using StaticArrays, AxisKeys
+    using StaticArrays, NamedDims
     using GRMHDSnapshots: plasma_state, ks_gcov
 
     path = joinpath(@__DIR__, "data", "iharm_fmks_a0.h5")

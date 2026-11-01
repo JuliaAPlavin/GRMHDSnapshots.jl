@@ -3,7 +3,7 @@ module GRMHDSnapshots
 using HDF5
 using StaticArrays
 using Unitful, UnitfulAstro
-using AxisKeys: NamedDimsArray, dimnames
+using NamedDims: NamedDimsArray
 using DataManipulation: mapview
 using OhMyThreads: tmap
 import StructArrays
@@ -352,8 +352,6 @@ Interpolate `(rho, velrel, bfield)` at Cartesian position `(x, y, z)`.
 end
 
 include("physics.jl")
-
-Adapt.adapt_structure(to, x::NamedDimsArray) = NamedDimsArray(Adapt.adapt(to, parent(x)), dimnames(x))
 
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
     Adapt.adapt(to, s.rho), Adapt.adapt(to, s.velrel), Adapt.adapt(to, s.bfield),
