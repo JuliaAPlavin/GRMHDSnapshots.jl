@@ -48,6 +48,26 @@ using TestItemRunner
     snap_vel = load_koral(store, "snap002000"; fields = (:velrel,))
     @test snap_vel.rho === nothing && snap_vel.bfield === nothing
     @test sample_field(snap_vel, snap_vel.velrel, 5.0, 0.0, 0.0) == ũ   # works with rho/bfield absent
+
+    # arrays of NamedTuple records: interpolated field by field, bitwise equal to the separate arrays
+    using NamedDims
+    recs = NamedDimsArray(map((ρ, ũ, B) -> (; ρ, ũ, B), parent(snap.rho), parent(snap.velrel), parent(snap.bfield)), (:φ, :θ, :r))
+    @test eltype(recs) == @NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}
+    # φ = 0 is across the φ wrap (φ0 > 0); y = ±0 straddles atan's ±π; z-axis points are at the θ edges
+    pts_in = [(5.0, 0.0, 0.0), (-7.0, -1e-9, 0.3), (-7.0, 1e-9, 0.3), (0.0, 0.0, 6.0), (0.0, 0.0, -6.0), (1e-6, 0.0, 8.0), (xn, yn, zn), (3.0, -4.0, 2.0)]
+    pts_out = [(0.0, 0.0, 10 * r_max(snap)), (0.1 * r_min(snap), 0.0, 0.0)]
+    RT = @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+    for p in [pts_in; pts_out]
+        rec = @inferred sample_field(snap, recs, p...)
+        @test rec isa RT
+        @test rec.ρ === sample_field(snap, snap.rho, p...)
+        @test rec.ũ === sample_field(snap, snap.velrel, p...)
+        @test rec.B === sample_field(snap, snap.bfield, p...)
+    end
+    @test all(p -> sample_field(snap, recs, p...) === (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64})), pts_out)
+
+    recs_u = NamedDimsArray(map(ũ -> (; ũ), parent(snap.velrel)), (:φ, :θ, :r))
+    @test all(p -> @inferred(sample_field(snap, recs_u, p...)) === (; ũ = sample_field(snap, snap.velrel, p...)), [pts_in; pts_out])
 end
 
 @testitem "extension-sniffing (one-arg zarr snap path)" begin

@@ -601,17 +601,25 @@ end
     return (; i, ti, k, kp, tk, ji, tji, jp, tjp)
 end
 
+# Elements are numbers, SVectors, or NamedTuple records of those (interpolated field by field).
+@inline _lerp(a, b, t) = a*(1 - t) + b*t
+@inline _lerp(a::NamedTuple{K}, b::NamedTuple{K}, t) where {K} = map((x, y) -> _lerp(x, y, t), a, b)
+
+# Not `zero`: Base has no `zero(::Type{<:NamedTuple})`, and defining one would be piracy.
+_zero(::Type{T}) where {T} = zero(T)
+_zero(::Type{T}) where {T<:NamedTuple} = T(map(_zero, fieldtypes(T)))
+
 # Apply a precomputed stencil to a single field array.
 @inline function _apply_stencil(st, A)
-    face(ir, jj, tj) = @inbounds (A[φ=st.k, θ=jj, r=ir]*(1-tj) + A[φ=st.k, θ=jj+1, r=ir]*tj)*(1-st.tk) +
-                                 (A[φ=st.kp, θ=jj, r=ir]*(1-tj) + A[φ=st.kp, θ=jj+1, r=ir]*tj)*st.tk
-    face(st.i, st.ji, st.tji)*(1 - st.ti) + face(st.i + 1, st.jp, st.tjp)*st.ti
+    face(ir, jj, tj) = @inbounds _lerp(_lerp(A[φ=st.k, θ=jj, r=ir], A[φ=st.k, θ=jj+1, r=ir], tj),
+                                       _lerp(A[φ=st.kp, θ=jj, r=ir], A[φ=st.kp, θ=jj+1, r=ir], tj), st.tk)
+    _lerp(face(st.i, st.ji, st.tji), face(st.i + 1, st.jp, st.tjp), st.ti)
 end
 
 """
     sample_field(snapshot, field_array, x, y, z)
 
-Interpolate a single fluid field array (e.g. `snap.velrel`) at Cartesian `(x, y, z)`.
+Interpolate a single fluid field array (e.g. `snap.velrel`, or an array of NamedTuple records) at Cartesian `(x, y, z)`.
 
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`.
@@ -619,12 +627,13 @@ Interpolate a single fluid field array (e.g. `snap.velrel`) at Cartesian `(x, y,
 - `x`, `y`, `z`: Cartesian coordinates in gravitational radii.
 
 # Returns
-- Interpolated value; `zero(eltype(field_array))` outside the grid.
+- Interpolated value (a record for NamedTuple elements); zero outside the grid.
 """
 @inline function sample_field(s::GRMHDSnapshot, A, x, y, z)
     st = _sample_stencil(s, size(A, :φ), x, y, z)
-    # `* one(weight)` promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
-    st === nothing ? zero(eltype(A)) * one(eltype(s.r_prof)) : _apply_stencil(st, A)
+    # `_lerp` with a weight promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
+    z0 = _zero(eltype(A))
+    st === nothing ? _lerp(z0, z0, one(eltype(s.r_prof))) : _apply_stencil(st, A)
 end
 
 """
