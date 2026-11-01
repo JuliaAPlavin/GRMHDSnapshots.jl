@@ -103,7 +103,7 @@ end
 end
 
 @testitem "plasma physics" begin
-    using StaticArrays, Zarr, NamedDims
+    using StaticArrays, Zarr, NamedDims, Accessors
     using LinearAlgebra: det
     using GRMHDSnapshots: plasma_state, ks_gcov
 
@@ -195,10 +195,18 @@ end
     @test size(vr) == size(snap.rho) && all(≥(1), vr)
     @test vr == [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr]
 
-    # Unit scalars are positive plain Float64.
-    @test lunit(snap) isa Float64 && lunit(snap) > 0
-    @test rhounit(snap) isa Float64 && rhounit(snap) > 0
-    @test bunit(snap) isa Float64 && bunit(snap) > 0
+    # Unit scalars are plain CGS Float64; koral stores M_bh = 6.5e9 M☉.
+    unitsof(s) = map(f -> f(s), [lunit, rhounit, bunit])
+    @test snap.MBH === 6.5e9
+    @test unitsof(snap) isa Vector{Float64}
+    @test unitsof(snap) ≈ [9.598062747325812e14, 1.65240595337281e-47, 4.32000262234225e-13]
+    # Float32 scalars (as after a whole-snapshot Float32 conversion) still give Float64 units, also where r_g³ in cm³
+    # or a large M_unit would overflow Float32.
+    snap32 = setproperties(snap, map(Float32, (; snap.φ0, snap.dφ, snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH)))
+    @test snap32.MBH isa Float32 && snap32.M_unit isa Float32
+    @test unitsof(snap32) isa Vector{Float64}
+    @test unitsof(snap32) ≈ unitsof(snap) rtol = 1e-6
+    @test unitsof(@set snap32.M_unit = 1f35) ≈ unitsof(@set snap.M_unit = 1e35) rtol = 1e-6
 
     # Kernel type stability on Float64 inputs.
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
@@ -366,20 +374,20 @@ end
     @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
 
     # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
-    @test_throws "lunit needs MBH (grams)" lunit(snap)
-    foreach(f -> @test_throws("$f needs M_unit and MBH", f(snap)), (rhounit, bunit))
-    snapb = load_iharm(path; MBH = 1.3e43)
+    @test_throws "lunit needs MBH (M☉)" lunit(snap)
+    foreach(f -> @test_throws("$f needs M_unit (g) and MBH (M☉)", f(snap)), (rhounit, bunit))
+    snapb = load_iharm(path; MBH = 6.5e9)
     @test snapb.M_unit === missing
-    @test lunit(snapb) ≈ 6.6743e-8*1.3e43/2.99792458e10^2 rtol = 1e-6
-    foreach(f -> @test_throws("$f needs M_unit (grams)", f(snapb)), (rhounit, bunit))
+    @test lunit(snapb) ≈ 9.598062747325812e14
+    foreach(f -> @test_throws("$f needs M_unit (g)", f(snapb)), (rhounit, bunit))
     snapm = load_iharm(path; M_unit = 1e26)
     @test snapm.MBH === missing
-    foreach(f -> @test_throws("$f needs MBH (grams)", f(snapm)), (lunit, rhounit, bunit))
+    foreach(f -> @test_throws("$f needs MBH (M☉)", f(snapm)), (lunit, rhounit, bunit))
     # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
     snapbm = @set snapb.M_unit = 1e26
     @test snapbm.M_unit === 1e26 && snapbm.rho == snap.rho
     @test rhounit(snapbm) ≈ 1e26/lunit(snapb)^3 && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
-    @test rhounit(@set snapm.MBH = 1.3e43) == rhounit(snapbm)
+    @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
     @test (@set snapbm.M_unit = missing).M_unit === missing
 
     c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
@@ -409,7 +417,7 @@ end
 
         # lazy units: scale-free by default ⇒ throw; supplied ⇒ positive scalars.
         @test_throws ArgumentError lunit(snap)
-        snapu = load_iharm(path; M_unit = 1e26, MBH = 1.3e43)
+        snapu = load_iharm(path; M_unit = 1e26, MBH = 6.5e9)
         @test lunit(snapu) > 0 && rhounit(snapu) > 0 && bunit(snapu) > 0
         # auto-detect routes an FMKS .h5 to load_iharm.
         @test load_snapshot(path).rho == snap.rho
@@ -599,8 +607,8 @@ end
     @test_throws ArgumentError load_hamr(dir; rcyl, rmin = 1e3)
     @test_throws ArgumentError load_hamr(dir; rcyl, fields = (:rho, :ug))
     @test_throws ArgumentError load_hamr(dir; rcyl, fields = ())
-    snapb = load_hamr(dir; rcyl, MBH = 1.3e43)                                     # units independently optional
-    @test snapb.MBH === 1.3e43 && snapb.M_unit === missing && lunit(snapb) > 0
+    snapb = load_hamr(dir; rcyl, MBH = 6.5e9)                                      # units independently optional
+    @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
     @test_throws "rhounit needs M_unit" rhounit(snapb)
     @test load_hamr(dir; rcyl, M_unit = 1e20).M_unit === 1e20
     bad = mktempdir()

@@ -18,8 +18,9 @@ export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_hamr, load_gri
 
 include("coordinates.jl")
 
-# `M_unit`/`MBH` each carry their own type parameter (`Um`, `Ub`): `Float64` when known, `Missing` when
-# not — scale-free dumps (e.g. iharm3d/KHARMA, H-AMR) store neither, and each can be supplied independently.
+# `M_unit` (code mass unit, g) and `MBH` (black-hole mass, M☉ — fits Float32, unlike grams) each carry their own
+# type parameter (`Um`, `Ub`): a number when known, `Missing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
+# H-AMR) store neither, and each can be supplied independently.
 # The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
 struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, Um, Ub}
     rho::Ar
@@ -124,7 +125,7 @@ function load_koral_h5(path::AbstractString; mmap=false)
         rdscalar(name) = Float64(read(h5[name]))
         GRMHDSnapshot(rho, velrel, bfield, r_prof, th_grid, φ0, dφ,
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
-            rdscalar("header/units/M_unit"), ustrip(u"g", rdscalar("header/units/M_bh") * u"Msun"))
+            rdscalar("header/units/M_unit"), rdscalar("header/units/M_bh"))
     end
 end
 
@@ -183,7 +184,7 @@ function load_koral(store::ZGroup, snapname::AbstractString;
     hdr = store.attrs; units = hdr["units"]
     GRMHDSnapshot(rho, velrel, bfield, grid.r_prof, grid.th_grid, grid.φ0, grid.dφ,
         sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
-        sc(units["M_unit"]), ustrip(u"g", sc(units["M_bh"]) * u"Msun"))
+        sc(units["M_unit"]), sc(units["M_bh"]))
 end
 
 """
@@ -198,8 +199,8 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 
 # Arguments
 - `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
-- `M_unit`, `MBH`: physical units in grams, each optional (default `missing`). These dumps are scale-free
-  (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
+- `M_unit`, `MBH`: physical units, `M_unit` in grams and `MBH` in M☉, each optional (default `missing`). These
+  dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
 - `GRMHDSnapshot`.
@@ -265,7 +266,7 @@ relative velocity `ũ^i`. Fluid arrays are `Float32` (the dump precision); trans
   corner `x20 = -1 + 1/n2` (`n2` the total θ cell count).
 - `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
 - `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
-- `M_unit`, `MBH`: physical units in grams, each optional, as for [`load_iharm`](@ref) (the dumps store none).
+- `M_unit`, `MBH`: physical units (g, M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot`.

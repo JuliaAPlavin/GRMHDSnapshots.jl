@@ -174,7 +174,8 @@ end
 # rather than propagate `missing`.
 function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
     miss = filter(n -> getproperty(snap, n) === missing, names)
-    isempty(miss) || throw(ArgumentError("$f needs $(join(miss, " and ")) (grams), missing from this snapshot; pass to the loader"))
+    units = (M_unit = "g", MBH = "M☉")
+    isempty(miss) || throw(ArgumentError("$f needs $(join(map(n -> "$n ($(units[n]))", miss), " and ")), missing from this snapshot; pass to the loader"))
 end
 
 """
@@ -182,7 +183,7 @@ end
 
 Gravitational radius r_g = G·MBH/c² in cm. Needs `MBH` only.
 """
-lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); ustrip(u"cm", Unitful.G*(snap.MBH*u"g")/Unitful.c0^2))
+lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); ustrip(u"cm", Unitful.G*(snap.MBH*u"Msun")/Unitful.c0^2))
 
 """
     rhounit(snap)
