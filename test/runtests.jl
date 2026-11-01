@@ -242,6 +242,49 @@ end
     end
 end
 
+@testitem "Kerr-Schild → Boyer-Lindquist vectors" begin
+    using StaticArrays, ForwardDiff
+    using GRMHDSnapshots: ks_gcov, fluid_ucon
+
+    # BL(KS) coordinate map: t_BL = t − T(r), φ_BL = φ − Φ(r), with T' = 2r/Δ, Φ' = a/Δ integrated in closed
+    # form by partial fractions over the horizons r± (abs: also valid between them).
+    function bl_coords(x, a)
+        t, r, θ, φ = x
+        rp, rm = 1 + √(1 - a^2), 1 - √(1 - a^2)
+        T = (2rp*log(abs(r - rp)) - 2rm*log(abs(r - rm)))/(rp - rm)
+        Φ = a/(rp - rm)*log(abs((r - rp)/(r - rm)))
+        SVector(t - T, r, θ, φ - Φ)
+    end
+    # standard Boyer-Lindquist covariant metric
+    function bl_gcov(r, θ, a)
+        Σ = r^2 + a^2*cos(θ)^2; Δ = r^2 - 2r + a^2; s2 = sin(θ)^2
+        @SMatrix [ -(1 - 2r/Σ)   0    0   -2a*r*s2/Σ ;
+                    0            Σ/Δ  0    0 ;
+                    0            0    Σ    0 ;
+                   -2a*r*s2/Σ    0    0    (r^2 + a^2 + 2a^2*r*s2/Σ)*s2 ]
+    end
+
+    vs = (SVector(1.0, 0.3, -0.02, 0.1), SVector(-0.5, -2.0, 0.4, 1.5), SVector(0.0, 1.0, 0.0, 0.0))
+    ũs = (SVector(0.3, 0.1, -0.2), SVector(-1.0, 0.2, 3.0), SVector(2.0, -0.05, 1.0))
+    # points outside the outer horizon and between the horizons (Δ < 0)
+    for a in (0.0, 0.5, 0.9375, 0.998), r in (1.2, 1.5, 2.3, 6.0, 40.0), θ in (0.2, π/2, 2.6)
+        J = ForwardDiff.jacobian(x -> bl_coords(x, a), SVector(0.7, r, θ, -1.1))
+        gks = ks_gcov(r, θ, a); gbl = bl_gcov(r, θ, a)
+        # coordinate vectors and timelike fluid velocities
+        for v in (vs..., map(ũ -> fluid_ucon(ũ, r, θ, a), ũs)...)
+            vbl = @inferred ks_to_bl(v, r, θ, a)
+            @test vbl ≈ J*v rtol = 1e-12
+            @test vbl'*gbl*vbl ≈ v'*gks*v rtol = 1e-10 atol = 1e-10*sum(abs2, v)
+        end
+        # metric pullback: the KS metric is J' g_BL J
+        @test J'*gbl*J ≈ gks rtol = 1e-10 atol = 1e-10
+        # vʳ = 0: unchanged
+        @test ks_to_bl(SVector(1.3, 0.0, -0.2, 0.05), r, θ, a) == SVector(1.3, 0.0, -0.2, 0.05)
+    end
+    # precision is carried through
+    @test ks_to_bl(SVector(1f0, 0.5f0, 0f0, 0.1f0), 6f0, 1f0, 0.9f0) isa SVector{4,Float32}
+end
+
 @testitem "field magnitudes: metric norms, not raw component norms" begin
     using StaticArrays
     using GRMHDSnapshots: flow_speed, proper_velocity, spatial_norm

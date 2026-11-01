@@ -147,6 +147,19 @@ its integral over the drawn `dx dy dz` box is metric-correct. → 1 as r → ∞
 """
 @inline volume_ratio(r, θ, a) = (r^2 + a^2*cos(θ)^2)/(r^2*lapse(r, θ, a))
 
+"""
+    ks_to_bl(v, r, θ, a)
+
+Boyer-Lindquist components of a contravariant 4-vector `v^μ` given in Kerr-Schild components at
+`(r, θ)` with spin `a`. The charts share `r` and `θ`; `t` and `φ` differ by functions of `r` alone
+(`dt_BL = dt_KS − (2r/Δ)dr`, `dφ_BL = dφ_KS − (a/Δ)dr`, `Δ = r² − 2r + a²`), so only `vᵗ` and `vᵠ`
+change, by multiples of `vʳ`. Singular at the horizons (Δ = 0), where BL is.
+"""
+@inline function ks_to_bl(v::SVector{4}, r, θ, a)
+    Δ = r^2 - 2r + a^2
+    SVector(v[1] - 2r/Δ*v[2], v[2], v[3], v[4] - a/Δ*v[2])
+end
+
 # ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
 # the downstream synchrotron code, which is plain CGS). ──
 

@@ -12,7 +12,7 @@ using Zarr: zopen, ZGroup
 using ZarrZfp
 
 export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_grid, r_min, r_max,
-    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, lunit, rhounit, bunit,
+    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
 include("coordinates.jl")
