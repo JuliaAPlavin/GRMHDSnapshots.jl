@@ -6,7 +6,7 @@ using LinearAlgebra: Diagonal
 using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
-using DataManipulation: mapview, filtermap, flatmap, group
+using DataManipulation: filtermap, flatmap, group
 using OhMyThreads: tmap, @tasks, @local, chunks
 import StructArrays
 import ForwardDiff
@@ -46,21 +46,19 @@ end
     load_snapshot(path; kwargs...)
 
 Load a single GRMHD snapshot, auto-detecting the on-disk format:
-- `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref)), read in memory;
-- `.h5` with a `quants/` group → koral ([`load_koral`](@ref)), memory-mapped;
+- `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref));
+- `.h5` with a `quants/` group → koral ([`load_koral`](@ref));
 - a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref));
 - a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` kwarg).
 
-Memory-mapping is chosen for the caller: koral `.h5` is mmapped, iharm reads in memory (its
-velocity/field components are reconstructed, not stored, so there is nothing to map). `kwargs...`
-go to the selected loader (e.g. `M_unit`/`MBH` for iharm); use the explicit loaders for full control.
+`kwargs...` go to the selected loader (e.g. `M_unit`/`MBH` for iharm); use the explicit loaders for full control.
 """
 function load_snapshot(path::AbstractString; kwargs...)
     p = rstrip(path, '/')
     fmt = snapshot_format(p)
     fmt === :iharm && return load_iharm(p; kwargs...)
     fmt === :hamr && return load_hamr(p; kwargs...)
-    endswith(p, ".h5") ? load_koral(p; mmap = true, kwargs...) : load_koral(p; kwargs...)
+    load_koral(p; kwargs...)
 end
 
 """
@@ -100,24 +98,13 @@ function load_koral(path::AbstractString; kwargs...)
         load_koral(zopen(dirname(p), "r")::ZGroup, basename(p); kwargs...)
 end
 
-function load_koral_h5(path::AbstractString; mmap=false)
+function load_koral_h5(path::AbstractString)
     h5open(path, "r") do h5
         nd(A) = NamedDimsArray(A, (:φ, :θ, :r))
-        if mmap
-            # mmap bytes keep file endianness.
-            order = HDF5.API.h5t_get_order(HDF5.datatype(h5["quants/rho"]).id)
-            swap = order == HDF5.API.H5T_ORDER_BE ? ntoh : ltoh
-            mm(name) = HDF5.readmmap(h5["quants/$name"])
-            rho = nd(mapview(swap, mm("rho")))
-            svf(a, b, c) = nd(mapview(v -> swap.(v),
-                StructArrays.StructArray{SVector{3,Float64}}((mm(a), mm(b), mm(c)))))
-            velrel = svf("U1", "U2", "U3"); bfield = svf("B1", "B2", "B3")
-        else
-            rd(name) = read(h5["quants/$name"])
-            rho = nd(rd("rho"))
-            sv3(a, b, c) = nd(SVector{3,Float64}.(a, b, c))
-            velrel = sv3(rd("U1"), rd("U2"), rd("U3")); bfield = sv3(rd("B1"), rd("B2"), rd("B3"))
-        end
+        rd(name) = read(h5["quants/$name"])
+        rho = nd(rd("rho"))
+        sv3(a, b, c) = nd(SVector{3,Float64}.(a, b, c))
+        velrel = sv3(rd("U1"), rd("U2"), rd("U3")); bfield = sv3(rd("B1"), rd("B2"), rd("B3"))
 
         r = read(h5["grid_out/r"]); th = read(h5["grid_out/th"]); ph = read(h5["grid_out/ph"])
         n1 = size(r, 3); n2 = size(r, 2); n3 = size(r, 1)

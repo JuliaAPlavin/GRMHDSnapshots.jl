@@ -78,16 +78,11 @@ end
 
     h5path = joinpath(@__DIR__, "data", "ipole_a0.9_2000.h5")
     if isfile(h5path)
-        s_mem = load_koral(h5path; mmap = false)
-        s_mm = load_koral(h5path; mmap = true)
-        @test s_mem.rho == s_mm.rho
-        @test s_mem.velrel == s_mm.velrel
-        @test s_mem.bfield == s_mm.bfield
-
-        @test r_min(s_mem) < r_max(s_mem)
-        @test (r_min(s_mem), r_max(s_mem)) == (r_min(s_mm), r_max(s_mm)) == (s_mem.r_prof[1], s_mem.r_prof[end])
-        @test all(>(0), diff(s_mem.r_prof))
-        ρ, ũ, B = sample(s_mem, 5.0, 0.0, 0.0)
+        s = load_koral(h5path)
+        @test r_min(s) < r_max(s)
+        @test (r_min(s), r_max(s)) == (s.r_prof[1], s.r_prof[end])
+        @test all(>(0), diff(s.r_prof))
+        ρ, ũ, B = sample(s, 5.0, 0.0, 0.0)
         @test isfinite(ρ) && all(isfinite, ũ) && all(isfinite, B)
 
         s_store = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
