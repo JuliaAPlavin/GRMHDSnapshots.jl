@@ -18,10 +18,10 @@ export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_hamr, load_gri
 
 include("coordinates.jl")
 
-# `M_unit`/`MBH` carry their own type parameter `U`: `Float64` when physical units are known,
-# `Missing` for scale-free dumps (e.g. iharm3d/KHARMA) loaded without them — then the unit scalars
-# `lunit`/`rhounit`/`bunit` throw rather than silently returning `missing`.
-struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, U}
+# `M_unit`/`MBH` each carry their own type parameter (`Um`, `Ub`): `Float64` when known, `Missing` when
+# not — scale-free dumps (e.g. iharm3d/KHARMA, H-AMR) store neither, and each can be supplied independently.
+# The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
+struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, Um, Ub}
     rho::Ar
     velrel::Av
     bfield::Ab
@@ -32,8 +32,8 @@ struct GRMHDSnapshot{Ar, Av, Ab, Rp, Tg, T, U}
     spin::T
     gam::T
     t::T
-    M_unit::U
-    MBH::U
+    M_unit::Um
+    MBH::Ub
 end
 
 """
@@ -198,15 +198,14 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 
 # Arguments
 - `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
-- `M_unit`, `MBH`: physical units in grams. These dumps are scale-free (no units stored), so pass
-  both to enable `lunit`/`rhounit`/`bunit`, or omit both (default `missing`) — those scalars then throw.
+- `M_unit`, `MBH`: physical units in grams, each optional (default `missing`). These dumps are scale-free
+  (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
 - `GRMHDSnapshot`.
 """
 function load_iharm(path::AbstractString; fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
     fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
-    (M_unit === missing) == (MBH === missing) || throw(ArgumentError("pass both M_unit and MBH, or neither"))
     h5open(path, "r") do h5
         rd(name) = read(h5[name])
         metric = strip(c -> c == '\0' || c == ' ', rd("header/metric"))
@@ -266,7 +265,7 @@ relative velocity `ũ^i`. Fluid arrays are `Float32` (the dump precision); trans
   corner `x20 = -1 + 1/n2` (`n2` the total θ cell count).
 - `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
 - `fields`: fluid fields to read; subset of `(:rho, :velrel, :bfield)`. Unselected are `nothing`.
-- `M_unit`, `MBH`: physical units in grams, as for [`load_iharm`](@ref) (the dumps store none).
+- `M_unit`, `MBH`: physical units in grams, each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot`.
@@ -275,7 +274,6 @@ function load_hamr(dir::AbstractString; rcyl, rmin = nothing, rmax = nothing,
                    fields = (:rho, :velrel, :bfield), M_unit = missing, MBH = missing)
     fields ⊆ (:rho, :velrel, :bfield) || throw(ArgumentError("unknown fluid field(s) in $fields"))
     isempty(fields) && throw(ArgumentError("no fluid fields requested"))
-    (M_unit === missing) == (MBH === missing) || throw(ArgumentError("pass both M_unit and MBH, or neither"))
     par = _hamr_parameters(joinpath(dir, "parameters"))
     (; blocks, lmax, rowlevel) = _hamr_blocks(dir, par)
     (; bs, nb, startx, dx) = par

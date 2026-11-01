@@ -170,30 +170,33 @@ end
 # ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
 # the downstream synchrotron code, which is plain CGS). ──
 
-# Scale-free dumps (e.g. iharm3d/KHARMA) carry no M_unit/MBH; fail loud rather than propagate `missing`.
-_require_units(snap::GRMHDSnapshot) = snap.M_unit === missing &&
-    throw(ArgumentError("snapshot has no physical units (M_unit/MBH); pass them to the loader to use lunit/rhounit/bunit"))
+# Scale-free dumps (e.g. iharm3d/KHARMA, H-AMR) may lack M_unit and/or MBH; fail loud naming the missing ones
+# rather than propagate `missing`.
+function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
+    miss = filter(n -> getproperty(snap, n) === missing, names)
+    isempty(miss) || throw(ArgumentError("$f needs $(join(miss, " and ")) (grams), missing from this snapshot; pass to the loader"))
+end
 
 """
     lunit(snap)
 
-Gravitational radius r_g = G·MBH/c² in cm.
+Gravitational radius r_g = G·MBH/c² in cm. Needs `MBH` only.
 """
-lunit(snap::GRMHDSnapshot) = (_require_units(snap); ustrip(u"cm", Unitful.G*(snap.MBH*u"g")/Unitful.c0^2))
+lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); ustrip(u"cm", Unitful.G*(snap.MBH*u"g")/Unitful.c0^2))
 
 """
     rhounit(snap)
 
-Code mass-density unit M_unit/r_g³ in g/cm³.
+Code mass-density unit M_unit/r_g³ in g/cm³. Needs both `M_unit` and `MBH`.
 """
-rhounit(snap::GRMHDSnapshot) = ustrip(u"g/cm^3", (snap.M_unit*u"g")/(lunit(snap)*u"cm")^3)
+rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); ustrip(u"g/cm^3", (snap.M_unit*u"g")/(lunit(snap)*u"cm")^3))
 
 """
     bunit(snap)
 
-Code field unit c·√(4π·ρ_unit) in Gauss.
+Code field unit c·√(4π·ρ_unit) in Gauss. Needs both `M_unit` and `MBH`.
 """
-bunit(snap::GRMHDSnapshot) = ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap))
+bunit(snap::GRMHDSnapshot) = (_require_units(snap, :bunit, :M_unit, :MBH); ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap)))
 
 # ── Full-grid derived arrays, (:φ,:θ,:r) matching snap.rho. For cell (φ=k,θ=j,r=i): coords r_prof[i],
 # th_grid[i,j]; primitives velrel/bfield[φ=k,θ=j,r=i]. Metric depends only on (r,θ). ──

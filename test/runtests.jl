@@ -335,7 +335,7 @@ end
 end
 
 @testitem "iharm FMKS loader: synthetic round-trip" begin
-    using HDF5, StaticArrays, NamedDims
+    using HDF5, StaticArrays, NamedDims, Accessors
     using GRMHDSnapshots: FMKS, bl_coord, jacobian_spatial, plasma_state, ks_gcov
 
     # Write a tiny valid FMKS dump and load it — exercises header parsing, prims unpacking, the grid
@@ -364,6 +364,23 @@ end
     @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
     @test snap.M_unit === missing && snap.MBH === missing         # scale-free by default
     @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
+
+    # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
+    @test_throws "lunit needs MBH (grams)" lunit(snap)
+    foreach(f -> @test_throws("$f needs M_unit and MBH", f(snap)), (rhounit, bunit))
+    snapb = load_iharm(path; MBH = 1.3e43)
+    @test snapb.M_unit === missing
+    @test lunit(snapb) ≈ 6.6743e-8*1.3e43/2.99792458e10^2 rtol = 1e-6
+    foreach(f -> @test_throws("$f needs M_unit (grams)", f(snapb)), (rhounit, bunit))
+    snapm = load_iharm(path; M_unit = 1e26)
+    @test snapm.MBH === missing
+    foreach(f -> @test_throws("$f needs MBH (grams)", f(snapm)), (lunit, rhounit, bunit))
+    # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
+    snapbm = @set snapb.M_unit = 1e26
+    @test snapbm.M_unit === 1e26 && snapbm.rho == snap.rho
+    @test rhounit(snapbm) ≈ 1e26/lunit(snapb)^3 && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
+    @test rhounit(@set snapm.MBH = 1.3e43) == rhounit(snapbm)
+    @test (@set snapbm.M_unit = missing).M_unit === missing
 
     c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
     for i in 1:n1, j in 1:n2, k in 1:n3
@@ -582,7 +599,10 @@ end
     @test_throws ArgumentError load_hamr(dir; rcyl, rmin = 1e3)
     @test_throws ArgumentError load_hamr(dir; rcyl, fields = (:rho, :ug))
     @test_throws ArgumentError load_hamr(dir; rcyl, fields = ())
-    @test_throws ArgumentError load_hamr(dir; rcyl, M_unit = 1e20)
+    snapb = load_hamr(dir; rcyl, MBH = 1.3e43)                                     # units independently optional
+    @test snapb.MBH === 1.3e43 && snapb.M_unit === missing && lunit(snapb) > 0
+    @test_throws "rhounit needs M_unit" rhounit(snapb)
+    @test load_hamr(dir; rcyl, M_unit = 1e20).M_unit === 1e20
     bad = mktempdir()
     foreach(f -> cp(joinpath(dir, f), joinpath(bad, f)), readdir(dir))
     open(io -> write(io, zeros(UInt8, 4)), joinpath(bad, "new_dump1"), "a")        # not a whole number of blocks
