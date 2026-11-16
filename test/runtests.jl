@@ -96,6 +96,7 @@ end
     h5path = joinpath(@__DIR__, "data", "ipole_a0.9_2000.h5")
     if isfile(h5path)
         s = load_koral(h5path)
+        @test s.M_unit === nothing && s.MBH === nothing        # a non-radiative run: scale-free
         @test r_min(s) < r_max(s)
         @test (r_min(s), r_max(s)) == (s.r_prof[1], s.r_prof[end])
         @test all(>(0), diff(s.r_prof))
@@ -118,13 +119,87 @@ end
     end
 end
 
+@testitem "koral header units: radiative runs only, M_unit a density" begin
+    using HDF5, StaticArrays, Zarr
+
+    # the header's M_unit is KORAL's rhoGU2CGS(1), a density: for a radiative run rhounit is it, and bunit the header's
+    # own B_unit; keywords override each unit independently
+    M_hdr, Mbh_hdr, B_hdr = 0.014610581643228402, 6.5e9, 1.2845747778405998e10
+    function checkunits(ld)
+        s = ld(; has_radiation = 1)
+        @test s.MBH === Mbh_hdr
+        @test rhounit(s) ≈ M_hdr rtol = 1e-12
+        @test bunit(s) ≈ B_hdr rtol = 1e-6
+        @test ld(; has_radiation = 1, MBH = 4e6).MBH === 4e6
+        @test ld(; has_radiation = 1, MBH = 4e6).M_unit === s.M_unit
+        @test ld(; has_radiation = 1, M_unit = 1e26).M_unit === 1e26
+        @test ld(; has_radiation = 1, M_unit = 1e26).MBH === Mbh_hdr
+        foreach((0, nothing)) do flag
+            s = ld(; has_radiation = flag)
+            @test s.M_unit === nothing && s.MBH === nothing
+            sk = ld(; has_radiation = flag, MBH = 6.5e9, M_unit = 1e26)
+            @test sk.MBH === 6.5e9 && sk.M_unit === 1e26
+        end
+    end
+
+    # Zarr: copies of the fixture (has_radiation = 0) with the flag set, and removed
+    src = joinpath(@__DIR__, "data", "koral_sample.zarr")
+    zattrs = read(joinpath(src, ".zattrs"), String)
+    @test occursin("\"has_radiation\":0,", zattrs)
+    zcopies = Dict(map((1, nothing)) do flag
+        dst = joinpath(mktempdir(), "run.zarr")
+        cp(src, dst)
+        write(joinpath(dst, ".zattrs"), replace(zattrs, "\"has_radiation\":0," => isnothing(flag) ? "" : "\"has_radiation\":$flag,"))
+        flag => dst
+    end)
+    zpath(flag) = flag == 0 ? src : zcopies[flag]
+    checkunits((; has_radiation, kw...) -> load_koral(zopen(zpath(has_radiation), "r"), "snap002000"; fields = (:ρ,), kw...))
+    @test load_koral(joinpath(zpath(1), "snap002000"); MBH = 4e6).MBH === 4e6
+
+    # synthetic koral .h5: datasets indexed (φ, θ, r), r depending on r only, θ on (θ, r), φ on φ, uniformly spaced
+    n3, n2, n1 = 4, 3, 5
+    rs = [2.0 + i^1.5 for i in 1:n1]
+    ths = [0.4 + 0.7j + 0.01i for i in 1:n1, j in 1:n2]
+    phs = [-π + (k - 1)*2π/n3 for k in 1:n3]
+    grid = (r = [rs[i] for k in 1:n3, j in 1:n2, i in 1:n1], th = [ths[i, j] for k in 1:n3, j in 1:n2, i in 1:n1],
+            ph = [phs[k] for k in 1:n3, j in 1:n2, i in 1:n1])
+    q(c) = [c + 0.001k + 0.01j + 0.1i for k in 1:n3, j in 1:n2, i in 1:n1]
+    quants = (rho = q(1.0), U1 = q(0.1), U2 = q(0.2), U3 = q(0.3), B1 = q(-1.0), B2 = q(-2.0), B3 = q(-3.0))
+    dir = mktempdir()
+    function h5file(flag)
+        path = joinpath(dir, "koral_$flag.h5")
+        h5open(path, "w") do h5
+            foreach(k -> write(h5, "quants/$k", quants[k]), keys(quants))
+            foreach(k -> write(h5, "grid_out/$k", grid[k]), keys(grid))
+            write(h5, "header/bhspin", 0.9); write(h5, "header/gam", 13/9); write(h5, "t", 2000.0)
+            write(h5, "header/units/M_unit", M_hdr); write(h5, "header/units/M_bh", Mbh_hdr)
+            isnothing(flag) || write(h5, "header/has_radiation", Int32(flag))
+        end
+        path
+    end
+    h5paths = Dict(map(f -> f => h5file(f), (1, 0, nothing)))
+    checkunits((; has_radiation, kw...) -> load_koral(h5paths[has_radiation]; kw...))
+    checkunits((; has_radiation, kw...) -> load_snapshot(h5paths[has_radiation]; kw...))
+
+    s = load_koral(h5paths[0])
+    @test size(s.fluid) == (n3, n2, n1)
+    @test s.spin == 0.9 && s.gam == 13/9 && s.t == 2000.0
+    @test s.r_prof == rs && s.th_grid == ths
+    @test s.φ0 ≈ phs[1] + π && s.dφ ≈ 2π/n3
+    k, j, i = 3, 2, 4
+    @test s.fluid[φ=k, θ=j, r=i].ρ == quants.rho[k, j, i]
+    @test s.fluid[φ=k, θ=j, r=i].ũ == SVector(quants.U1[k, j, i], quants.U2[k, j, i], quants.U3[k, j, i])
+    @test s.fluid[φ=k, θ=j, r=i].B == SVector(quants.B1[k, j, i], quants.B2[k, j, i], quants.B3[k, j, i])
+end
+
 @testitem "plasma physics" begin
     using StaticArrays, Zarr, NamedDims, Accessors
     using LinearAlgebra: det
     using GRMHDSnapshots: plasma_state, ks_gcov, spatial_norm
 
     store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
-    snap = load_koral(store, "snap002000")
+    # the fixture run is non-radiative, so scale-free: units given explicitly
+    snap = load_koral(store, "snap002000"; MBH = 6.5e9, M_unit = 1e26)
     a = snap.spin
 
     # Physical invariants of the reconstructed plasma state at sampled cells:
@@ -196,7 +271,7 @@ end
     @test map_plasma((_, _, c) -> c.ρ, snap) == map(c -> c.ρ, snap.fluid)
 
     # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no ρ needed.
-    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B))
+    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B), MBH = 6.5e9, M_unit = 1e26)
     @test !hasfield(eltype(snap_bv.fluid), :ρ)
     @test comoving_bsq(snap_bv) == bsqg
     @test comoving_B_gauss(snap_bv) == comoving_B_gauss(snap)
@@ -229,11 +304,17 @@ end
     @test map_plasma((_, _, c) -> c.ũ, snap) ≈ map(c -> c.ũ, snap.fluid) rtol = 1e-13
     @test map_plasma((_, _, c) -> c.B, snap) ≈ map(c -> c.B, snap.fluid) rtol = 1e-13
 
-    # Unit scalars are plain CGS Float64; koral stores M_bh = 6.5e9 M☉.
+    # Unit scalars are plain CGS Float64. The fixture's header units (M_bh = 6.5e9) are placeholders of a non-radiative
+    # run: without keywords it has none.
+    snap0 = load_koral(store, "snap002000")
+    @test snap0.M_unit === nothing && snap0.MBH === nothing
+    @test_throws "lunit needs MBH (M☉)" lunit(snap0)
     unitsof(s) = map(f -> f(s), [lunit, rhounit, bunit])
-    @test snap.MBH === 6.5e9
+    @test snap.MBH === 6.5e9 && snap.M_unit === 1e26
     @test unitsof(snap) isa Vector{Float64}
-    @test unitsof(snap) ≈ [9.598062747325812e14, 1.65240595337281e-47, 4.32000262234225e-13]
+    @test lunit(snap) ≈ 9.598062747325812e14
+    @test rhounit(snap) ≈ 1e26/lunit(snap)^3
+    @test bunit(snap) ≈ 2.99792458e10*sqrt(4π*rhounit(snap))
     # Float32 scalars (as after a whole-snapshot Float32 conversion) still give Float64 units, also where r_g³ in cm³
     # or a large M_unit would overflow Float32.
     snap32 = setproperties(snap, map(Float32, (; snap.φ0, snap.dφ, snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH)))

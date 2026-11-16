@@ -181,12 +181,15 @@ function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
     isempty(miss) || throw(ArgumentError("$f needs $(join(map(n -> "$n ($(units[n]))", miss), " and ")), missing from this snapshot; pass to the loader"))
 end
 
+# Gravitational radius G·MBH/c² in cm of a black-hole mass MBH in M☉.
+_rg_cm(MBH) = ustrip(u"cm", Unitful.G*(MBH*u"Msun")/Unitful.c0^2)
+
 """
     lunit(snap)
 
 Gravitational radius r_g = G·MBH/c² in cm. Needs `MBH` only.
 """
-lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); ustrip(u"cm", Unitful.G*(snap.MBH*u"Msun")/Unitful.c0^2))
+lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); _rg_cm(snap.MBH))
 
 """
     rhounit(snap)

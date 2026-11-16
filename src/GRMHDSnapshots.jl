@@ -23,7 +23,7 @@ include("coordinates.jl")
 
 # `M_unit` (code mass unit, g) and `MBH` (black-hole mass, M☉ — fits Float32, unlike grams) each carry their own
 # type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
-# H-AMR) store neither, and each can be supplied independently.
+# H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
 # `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
 # `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
@@ -91,7 +91,9 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 
 # Arguments
 - `path`: `.h5` file, or `.../RUN.zarr/snapNNNN` store snapshot path.
-- `kwargs...`: Forwarded to the selected loader.
+- `kwargs...`: Forwarded to the selected loader; both take `M_unit = nothing, MBH = nothing` (g, M☉), each overriding
+  the header's value independently. Without them the header units are used for radiative runs only, as described for
+  the store method `load_koral(store, snapname)`.
 
 # Returns
 - `GRMHDSnapshot`.
@@ -103,7 +105,17 @@ function load_koral(path::AbstractString; kwargs...)
         load_koral(zopen(dirname(p), "r")::ZGroup, basename(p); kwargs...)
 end
 
-function load_koral_h5(path::AbstractString)
+# Units (M_unit in g, MBH in M☉) of a koral snapshot: each keyword if given, else from the header if the run is
+# radiative, else `nothing`. The header's `M_unit` is KORAL's rhoGU2CGS(1), a density in g/cm³, turned into grams with
+# r_g from the header's `M_bh`; it and `M_bh` are real only for radiative runs (as in ipole): otherwise the run is
+# scale-free and they are placeholders. `hdr()` gives the header's `(; M_unit, M_bh)`, read only when used.
+function _koral_units(radiative::Bool, hdr; M_unit, MBH)
+    h = radiative ? hdr() : nothing
+    (M_unit = !isnothing(M_unit) ? M_unit : radiative ? h.M_unit*_rg_cm(h.M_bh)^3 : nothing,
+     MBH = !isnothing(MBH) ? MBH : radiative ? h.M_bh : nothing)
+end
+
+function load_koral_h5(path::AbstractString; M_unit = nothing, MBH = nothing)
     h5open(path, "r") do h5
         rd(name) = read(h5["quants/$name"])
         fluid = _interleave(map(names -> _koral_column(Float64, map(rd, names)), _KORAL_COMPONENTS))
@@ -117,9 +129,11 @@ function load_koral_h5(path::AbstractString)
         φ0 = φ0_file + π
 
         rdscalar(name) = Float64(read(h5[name]))
+        radiative = haskey(h5, "header/has_radiation") && read(h5["header/has_radiation"]) != 0
+        u = _koral_units(radiative, () -> (M_unit = rdscalar("header/units/M_unit"), M_bh = rdscalar("header/units/M_bh"));
+                         M_unit, MBH)
         GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ, Val(one(SMatrix{3,3,Int})),
-            rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"),
-            rdscalar("header/units/M_unit"), rdscalar("header/units/M_bh"))
+            rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"), u.M_unit, u.MBH)
     end
 end
 
@@ -164,7 +178,7 @@ function load_grid(store::ZGroup)
 end
 
 """
-    load_koral(store, snapname; fields=(:ρ, :ũ, :B), grid=load_grid(store))
+    load_koral(store, snapname; fields=(:ρ, :ũ, :B), grid=load_grid(store), M_unit=nothing, MBH=nothing)
 
 Load one snapshot from an open Zarr run store.
 
@@ -173,12 +187,16 @@ Load one snapshot from an open Zarr run store.
 - `snapname`: Snapshot group name, e.g. `"snap002000"`.
 - `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`.
 - `grid`: Cached grid from `load_grid(store)`.
+- `M_unit`, `MBH`: physical units (g, M☉), each overriding the header independently. Otherwise both come from the
+  header if the run is radiative (`has_radiation` present and nonzero), else are `nothing`: as in ipole, the header
+  units are real only for radiative runs, a scale-free run stores placeholders. The header's `M_unit` is a density
+  (g/cm³), converted to grams with r_g from its `M_bh`, so `rhounit` is that density.
 
 # Returns
 - `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float32`.
 """
 function load_koral(store::ZGroup, snapname::AbstractString;
-                    fields = (:ρ, :ũ, :B), grid = load_grid(store))
+                    fields = (:ρ, :ũ, :B), grid = load_grid(store), M_unit = nothing, MBH = nothing)
     ks = _fluid_keys(fields)
     snap = store[snapname]::ZGroup
     rd(name) = Threads.@spawn snap[name][:, :, :]                # each zfp chunk decompresses independently
@@ -187,10 +205,11 @@ function load_koral(store::ZGroup, snapname::AbstractString;
     fluid = _interleave(map(ts -> _koral_column(Float32, map(fetch, ts)), tasks))
 
     sc(x) = Float64(x)
-    hdr = store.attrs; units = hdr["units"]
+    hdr = store.attrs
+    u = _koral_units(get(hdr, "has_radiation", 0) != 0, () -> (M_unit = sc(hdr["units"]["M_unit"]), M_bh = sc(hdr["units"]["M_bh"]));
+                     M_unit, MBH)
     GRMHDSnapshot(fluid, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
-        Val(one(SMatrix{3,3,Int})), sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]),
-        sc(units["M_unit"]), sc(units["M_bh"]))
+        Val(one(SMatrix{3,3,Int})), sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]), u.M_unit, u.MBH)
 end
 
 """
