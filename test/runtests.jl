@@ -539,25 +539,25 @@ end
     @test_throws ArgumentError load_iharm(path; fields = ())
     @test_throws ArgumentError load_iharm(path; fields = (:velrel,))
     @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
-    @test snap.M_unit === missing && snap.MBH === missing         # scale-free by default
+    @test snap.M_unit === nothing && snap.MBH === nothing         # scale-free by default
     @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
 
     # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
     @test_throws "lunit needs MBH (M☉)" lunit(snap)
     foreach(f -> @test_throws("$f needs M_unit (g) and MBH (M☉)", f(snap)), (rhounit, bunit))
     snapb = load_iharm(path; MBH = 6.5e9)
-    @test snapb.M_unit === missing
+    @test snapb.M_unit === nothing
     @test lunit(snapb) ≈ 9.598062747325812e14
     foreach(f -> @test_throws("$f needs M_unit (g)", f(snapb)), (rhounit, bunit))
     snapm = load_iharm(path; M_unit = 1e26)
-    @test snapm.MBH === missing
+    @test snapm.MBH === nothing
     foreach(f -> @test_throws("$f needs MBH (M☉)", f(snapm)), (lunit, rhounit, bunit))
     # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
     snapbm = @set snapb.M_unit = 1e26
     @test snapbm.M_unit === 1e26 && snapbm.fluid == snap.fluid
     @test rhounit(snapbm) ≈ 1e26/lunit(snapb)^3 && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
     @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
-    @test (@set snapbm.M_unit = missing).M_unit === missing
+    @test (@set snapbm.M_unit = nothing).M_unit === nothing
 
     @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
     c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
@@ -790,7 +790,7 @@ end
         @test size(snap.fluid) == (192, 192, 3)
         @test dimnames(snap.fluid) == (:φ, :θ, :r)
         @test parent(snap.fluid) isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
-        @test snap.M_unit === missing && snap.MBH === missing
+        @test snap.M_unit === nothing && snap.MBH === nothing
         R = SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0)
         @test snap.R === Val(R)
 
@@ -914,7 +914,7 @@ end
         @test snapshot_format(dir) === :hamr
         @test load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid == map(c -> (; c.ρ), snap.fluid)
         snapb = ld(rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
-        @test snapb.MBH === 6.5e9 && snapb.M_unit === missing && lunit(snapb) ≈ 9.598062747325812e14
+        @test snapb.MBH === 6.5e9 && snapb.M_unit === nothing && lunit(snapb) ≈ 9.598062747325812e14
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
     end

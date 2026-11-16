@@ -174,9 +174,9 @@ end
 # the downstream synchrotron code, which is plain CGS). ──
 
 # Scale-free dumps (e.g. iharm3d/KHARMA, H-AMR) may lack M_unit and/or MBH; fail loud naming the missing ones
-# rather than propagate `missing`.
+# rather than compute with `nothing`.
 function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
-    miss = filter(n -> getproperty(snap, n) === missing, names)
+    miss = filter(n -> getproperty(snap, n) === nothing, names)
     units = (M_unit = "g", MBH = "M☉")
     isempty(miss) || throw(ArgumentError("$f needs $(join(map(n -> "$n ($(units[n]))", miss), " and ")), missing from this snapshot; pass to the loader"))
 end

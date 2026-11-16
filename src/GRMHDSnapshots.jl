@@ -22,9 +22,9 @@ export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_hamr, load_gri
 include("coordinates.jl")
 
 # `M_unit` (code mass unit, g) and `MBH` (black-hole mass, M☉ — fits Float32, unlike grams) each carry their own
-# type parameter (`Um`, `Ub`): a number when known, `Missing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
+# type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
 # H-AMR) store neither, and each can be supplied independently.
-# The unit scalars needing a missing one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than return `missing`.
+# The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
 # `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
 # `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
 # (lab field B^i), vectors in Kerr-Schild components of the grid's spherical coordinates; a partial load holds only the
@@ -194,7 +194,7 @@ function load_koral(store::ZGroup, snapname::AbstractString;
 end
 
 """
-    load_iharm(path; fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
+    load_iharm(path; fields=(:ρ, :ũ, :B), M_unit=nothing, MBH=nothing)
 
 Load an iharm3d/KHARMA `.h5` dump in FMKS coordinates (`header/metric` == `"FMKS"`/`"MMKS"`).
 
@@ -205,13 +205,13 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 
 # Arguments
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
-- `M_unit`, `MBH`: physical units, `M_unit` in grams and `MBH` in M☉, each optional (default `missing`). These
+- `M_unit`, `MBH`: physical units, `M_unit` in grams and `MBH` in M☉, each optional (default `nothing`). These
   dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
 - `GRMHDSnapshot`.
 """
-function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = missing, MBH = missing)
+function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = nothing, MBH = nothing)
     ks = _fluid_keys(fields)
     h5open(path, "r") do h5
         rd(name) = read(h5[name])
@@ -251,7 +251,7 @@ end
 _cellmap(fs::NamedTuple, n) = [map(f -> f(k, j, i), fs) for k in 1:n[1], j in 1:n[2], i in 1:n[3]]
 
 """
-    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=missing, MBH=missing)
+    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=nothing, MBH=nothing)
 
 Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …), restricted to the radial cells
 whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range are read, and only their radial slabs within it.
@@ -290,7 +290,7 @@ averaging. Stored values are used without correction, placed at the standard cel
 - `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.
 """
 function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
-                   fields = (:ρ, :ũ, :B), M_unit = missing, MBH = missing)
+                   fields = (:ρ, :ũ, :B), M_unit = nothing, MBH = nothing)
     ks = _fluid_keys(fields)
     keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
     all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
