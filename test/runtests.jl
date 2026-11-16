@@ -66,6 +66,18 @@ using TestItemRunner
         @test @inferred(sample(snap_vb, p...)) === (; full.ũ, full.B)
     end
     @test sample(snap_vel, 5.0, 0.0, 0.0).ũ == ũ
+
+    # ug, from the `uint` arrays (values read directly from the fixture), only when requested; sampled like ρ
+    s4 = load_koral(store, "snap002000"; fields = (:B, :ug, :ũ, :ρ))
+    @test parent(s4.fluid) isa Array{@NamedTuple{ρ::Float32, ug::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
+    @test map(c -> (; c.ρ, c.ũ, c.B), s4.fluid) == snap.fluid
+    @test s4.fluid[φ=12, θ=16, r=20].ug === 0.0006992817f0 && s4.fluid[φ=3, θ=8, r=10].ug === 0.003289342f0
+    @test load_koral(store, "snap002000"; fields = (:ug,)).fluid == map(c -> (; c.ug), s4.fluid)
+    RT4 = @NamedTuple{ρ::Float64, ug::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+    @test all(p -> @inferred(sample(s4, p...)) isa RT4, [pts_in; pts_out])
+    @test all(p -> (r = sample(s4, p...); (; r.ρ, r.ũ, r.B) === sample(snap, p...)), [pts_in; pts_out])
+    @test sample(s4, xn, yn, zn).ug ≈ 0.0006992817f0 rtol = 1e-12
+    @test sample(s4, pts_out[1]...).ug === 0.0
 end
 
 @testitem "extension-sniffing (one-arg zarr snap path)" begin
@@ -180,7 +192,7 @@ end
     grid = (r = [rs[i] for k in 1:n3, j in 1:n2, i in 1:n1], th = [ths[i, j] for k in 1:n3, j in 1:n2, i in 1:n1],
             ph = [phs[k] for k in 1:n3, j in 1:n2, i in 1:n1])
     q(c) = [c + 0.001k + 0.01j + 0.1i for k in 1:n3, j in 1:n2, i in 1:n1]
-    quants = (rho = q(1.0), U1 = q(0.1), U2 = q(0.2), U3 = q(0.3), B1 = q(-1.0), B2 = q(-2.0), B3 = q(-3.0))
+    quants = (rho = q(1.0), uint = q(0.5), U1 = q(0.1), U2 = q(0.2), U3 = q(0.3), B1 = q(-1.0), B2 = q(-2.0), B3 = q(-3.0))
     dir = mktempdir()
     function h5file(flag)
         path = joinpath(dir, "koral_$flag.h5")
@@ -206,6 +218,10 @@ end
     @test s.fluid[φ=k, θ=j, r=i].ρ == quants.rho[k, j, i]
     @test s.fluid[φ=k, θ=j, r=i].ũ == SVector(quants.U1[k, j, i], quants.U2[k, j, i], quants.U3[k, j, i])
     @test s.fluid[φ=k, θ=j, r=i].B == SVector(quants.B1[k, j, i], quants.B2[k, j, i], quants.B3[k, j, i])
+    @test !hasfield(eltype(s.fluid), :ug)
+    sug = load_koral(h5paths[0]; fields = (:ug, :ρ))
+    @test eltype(sug.fluid) == @NamedTuple{ρ::Float64, ug::Float64}
+    @test sug.fluid[φ=k, θ=j, r=i].ug ≈ 0.923 rtol = 1e-15
 
     # partial loads: the requested fields only, in the order (ρ, ũ, B), each the same data; the grid is the same
     using NamedDims
@@ -377,6 +393,16 @@ end
 
     # Kernel type stability on Float64 inputs.
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
+
+    # plasma β = (γ−1)·ug/(b²/2): 2·(4/9)·0.3/0.2 = 4/3; Float32 stays Float32
+    @test plasma_beta(0.3, 0.2, 13/9) ≈ 4/3 rtol = 1e-15
+    @test @inferred(plasma_beta(0.3f0, 0.2f0, 13f0/9)) isa Float32
+    @test plasma_beta(0.3f0, 0.2f0, 13f0/9) ≈ 4/3 rtol = 1e-6
+    # the grid map: the scalar at each cell's comoving b²; needs ug
+    snap_ug = load_koral(store, "snap002000"; fields = (:ug, :ũ, :B))
+    βg = plasma_beta(snap_ug)
+    @test dimnames(βg) == (:φ, :θ, :r) && eltype(βg) == Float64
+    @test βg == map((c, bsq) -> plasma_beta(c.ug, bsq, snap.gam), snap_ug.fluid, bsqg)
 end
 
 @testitem "spin frame turned relative to the grid" begin
@@ -669,6 +695,13 @@ end
     @test eltype(snap.fluid) == @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
     sp = load_iharm(path; fields = (:B, :ρ))
     @test eltype(sp.fluid) == @NamedTuple{ρ::Float64, B::SVector{3,Float64}} && sp.fluid == map(c -> (; c.ρ, c.B), snap.fluid)
+    # ug from prims slot 2 (UU): prims[2, k, j, i] = 0.01·(2 + 8·(k−1 + 2(j−1 + 3(i−1))))
+    s4 = load_iharm(path; fields = (:B, :ũ, :ug, :ρ))
+    @test eltype(s4.fluid) == @NamedTuple{ρ::Float64, ug::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
+    @test map(c -> (; c.ρ, c.ũ, c.B), s4.fluid) == snap.fluid
+    @test map(c -> c.ug, s4.fluid[φ=1, θ=1, r=1:4]) ≈ [0.02, 0.5, 0.98, 1.46] rtol = 1e-14
+    @test s4.fluid[φ=2, θ=3, r=4].ug ≈ 1.86 rtol = 1e-14
+    @test load_iharm(path; fields = (:ug,)).fluid == map(c -> (; c.ug), s4.fluid)
     @test_throws ArgumentError load_iharm(path; fields = ())
     @test_throws ArgumentError load_iharm(path; fields = (:velrel,))
     @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
@@ -1063,7 +1096,7 @@ end
 end
 
 @testitem "H-AMR native loader: stored blocks (optional, isfile-guarded)" begin
-    using StaticArrays, NamedDims
+    using StaticArrays, NamedDims, Statistics
     using GRMHDSnapshots: sample, HAMRSph, HAMRCyl, _hamr_parameters, _hamr_blocks, _tospin, _sample_frame
     using GRMHDSnapshots.IntervalSets: Interval, (..)
 
@@ -1149,12 +1182,19 @@ end
             maximum(I -> abs(u0[Tuple(I)..., b]/stored[3, I] - 1), CartesianIndices(reverse(bs)))
         end
         @test map(c -> c.ρ, parent(s.fluid)[:, :, :, b]) == stored[1, :, :, :]
+        @test map(c -> c.ug, parent(ld(rmin = 4, rmax = 4.2, fields = (:ug,)).fluid)[:, :, :, b]) == stored[2, :, :, :]
         @test u0dev(s) < 1e-2
         @test all(a -> u0dev(load_hamr(dir; rcyl = nothing, spin_axis = a, rmin = 4, rmax = 4.2)) > 1e-2, ((0, 0, 1), (1, 0, 0)))
+
+        # plasma β of the weakly magnetized (σ < 0.01) gas within r ≤ 100: of order unity; ug floored positive
+        s4 = ld(rmax = 100, fields = (:ρ, :ug, :ũ, :B))
+        @test all(c -> c.ug > 0, parent(s4.fluid))
+        @test 3.6 < median(plasma_beta(s4)[magnetization(s4) .< 0.01]) < 3.7
 
         # type-stable and allocation-free lookup
         q = R*(4.1*SVector(0.3, -0.5, 0.8)/sqrt(0.98))
         @inferred sample(s, q...)
+        @inferred sample(s4, q...)
         alloc(s, q) = @allocated sample(s, q...)
         alloc(s, q)
         @test alloc(s, q) == 0
@@ -1194,6 +1234,8 @@ end
         ep = ld(fields = (:B, :ρ)); lp = ld(fields = (:B, :ρ), lazy = true)
         @test !(parent(lp.fluid) isa Array) && eltype(lp.fluid) == @NamedTuple{ρ::Float32, B::SVector{3,Float32}}
         @test same(parent(lp.fluid), parent(ep.fluid))
+        eu = ld(fields = (:ug, :ρ)); lu = ld(fields = (:ug, :ρ), lazy = true)
+        @test eltype(lu.fluid) == @NamedTuple{ρ::Float32, ug::Float32} && same(parent(lu.fluid), parent(eu.fluid))
         # resample reads the cells it needs; copies and averages are the same
         for maxlevel in ((;), cap)
             rl = resample(l; maxlevel); re = resample(e; maxlevel)
@@ -1263,7 +1305,7 @@ end
     startx = SVector(log(2.0), -0.9, 0.3); ext0 = SVector((log(100.0) - log(2.0))/2, 0.9, π)
     g = BlockGrid(HAMRSph(), level, coord, nb, startx, ext0, Interval(2.0, 100.0))
     # records encoding (block, cell), cells 0-based
-    rec(b, i, j, k) = (ρ = 1000.0b + 100i + 10j + k, ũ = SVector(0.01b, 0.02i - 0.03, 0.01j + 0.001k),
+    rec(b, i, j, k) = (ρ = 1000.0b + 100i + 10j + k, ug = 0.5b + 0.1k, ũ = SVector(0.01b, 0.02i - 0.03, 0.01j + 0.001k),
                        B = SVector(0.1k, -0.05b, 0.2i*j + 0.25))
     fluid = NamedDimsArray([rec(b, i, j, k) for k in 0:bs[3]-1, j in 0:bs[2]-1, i in 0:bs[1]-1, b in 1:nblk], (:φ, :θ, :r, :block))
     I3 = Val(one(SMatrix{3,3,Int}))
@@ -1299,6 +1341,7 @@ end
     end
     (b, i, j, k) = cells[100]
     @test _grid_sample(g, fluid, at(b, i, j, k, zero(SVector{3}))) === fluid[k+1, j+1, i+1, b]
+    @test sample(snap, at(5, 1, 1, 3, zero(SVector{3}))...).ug ≈ 2.8 rtol = 1e-15
     @test any(c -> centre(c...)[3] > π, cells)
     @test all(c -> ref(centre(c...)) == c, cells)
 
@@ -1318,7 +1361,7 @@ end
     end
 
     # outside r_extent: zeros
-    Z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))
+    Z = (ρ = 0.0, ug = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))
     @test all(p -> sample(snap, p...) === Z, [(1.5, 0.0, 0.0), (0.0, 0.0, -1.9), (150.0, 1.0, 2.0), (0.0, 0.0, 0.0)])
 
     # type-stable and allocation-free
@@ -1334,7 +1377,7 @@ end
     fluid32 = NamedDimsArray(map(c -> map(x -> Float32.(x), c), parent(fluid)), names)
     g32 = BlockGrid(HAMRSph(), level, coord, nb, Float32.(startx), Float32.(ext0), Interval(2f0, 100f0))
     snap32 = GRMHDSnapshot(fluid32, g32, I3, 0.9f0, Float32(4/3), 0f0, nothing, nothing)
-    RT32 = @NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}
+    RT32 = @NamedTuple{ρ::Float32, ug::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}
     @test @inferred(sample(snap32, Float32.(q)...)) isa RT32
     @test @inferred(sample(snap32, 0f0, 0f0, 1f3)) isa RT32
     @test !occursin("Float64", string(code_typed(_grid_sample, Tuple{typeof(g32), typeof(fluid32), SVector{3,Float32}})))
@@ -1446,12 +1489,12 @@ end
     coord2 = [lv(0, 0, 0), lv(0, 0, 2), lv(0, 0, 3), lv(1, 0, 2), lv(1, 0, 3)]
     level2 = [lv(0, 0, 0), fill(lv(1, 0, 1), 4)...]
     ρ(b, i, k) = b == 1 ? 1000 + 2i + k : 100coord2[b][1] + 10coord2[b][3] + 2i + k
-    rec(x) = (ρ = Float32(x), ũ = SVector{3,Float32}(x, -x, 0))
+    rec(x) = (ρ = Float32(x), ug = Float32(2x), ũ = SVector{3,Float32}(x, -x, 0))
     F = [rec(ρ(b, i, k)) for k in 0:1, j in 0:0, i in 0:1, b in 1:5]
     g2(blk, rext) = BlockGrid(HAMRSph(), level2[blk], coord2[blk], nb2, SVector(0.0, -0.5, 0.0), SVector(log(4.0), 1.0, π), rext)
     s2 = mk(F, g2(1:5, Interval(1.0, 4.0)))
     ρs(s) = map(c -> c.ρ, parent(s.fluid)[:, 1, :])
-    vecok(s) = all(c -> c.ũ == SVector(c.ρ, -c.ρ, 0), parent(s.fluid))
+    vecok(s) = all(c -> c.ug == 2c.ρ && c.ũ == SVector(c.ρ, -c.ρ, 0), parent(s.fluid))
 
     # uncapped, level (1, 0, 1): every output cell a copy
     u = resample(s2)
@@ -1507,11 +1550,15 @@ end
     cyl = HAMRCyl(startx1 = 0.19325057145871735, x10 = log(24.32), x20 = -1 + 1/1056)
     alloc(A, k, j, i, b) = @allocated A[k, j, i, b]
 
-    for coords in (HAMRSph(), cyl), ks in ((:ρ, :ũ, :B), (:ρ,), (:B,), (:ρ, :ũ))
-        E = typeof((ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks])
-        Rec = typeof((ρ = 0f0, ũ = zero(SVector{3,Float32}), B = zero(SVector{3,Float32}))[ks])
+    for coords in (HAMRSph(), cyl), ks in ((:ρ, :ũ, :B), (:ρ,), (:B,), (:ρ, :ũ), (:ρ, :ug), (:ug,), (:ρ, :ug, :ũ, :B))
+        E = typeof((ρ = 0.0, ug = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks])
+        Rec = typeof((ρ = 0f0, ug = 0f0, ũ = zero(SVector{3,Float32}), B = zero(SVector{3,Float32}))[ks])
         A = _hamr_records(cells, level, coord, startx, ext0, bs, coords, Rv, a, ks)
         @test A isa AbstractArray{Rec,4} && !(A isa Array) && size(A) == (reverse(bs)..., nblk)
+        # the cell geometry only for vector fields; the scalars as stored (rho, ug: columns 1, 2)
+        @test isnothing(_hamr_center_geometry(E, coords, startx[1], startx[2])) == (ks ⊆ (:ρ, :ug))
+        :ρ in ks && @test all(I -> A[I].ρ === stored[I][1], CartesianIndices(stored))
+        :ug in ks && @test all(I -> A[I].ug === stored[I][2], CartesianIndices(stored))
 
         # reference: each cell converted on its own, at its block's centres
         ref = stack(1:nblk) do b

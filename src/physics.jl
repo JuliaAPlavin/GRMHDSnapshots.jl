@@ -365,6 +365,17 @@ Per-cell magnetization σ = b²/ρ [code units], as an array like `snap.fluid`. 
 magnetization(snap::GRMHDSnapshot) = map_plasma((ps, _, c) -> ps.bsq/c.ρ, snap)
 
 """
+    plasma_beta(ug, bsq, gam)
+    plasma_beta(snap)
+
+Plasma β = P_gas/P_mag = (γ_ad − 1)·ug/(b²/2) from the internal energy density `ug`, comoving `bsq` and adiabatic
+index `gam`, code (Heaviside–Lorentz) units as in ipole. The grid method needs `ug`, `ũ` and `B` loaded, and gives an
+array like `snap.fluid`.
+"""
+plasma_beta(ug, bsq, gam) = 2(gam - 1)*ug/bsq
+plasma_beta(snap::GRMHDSnapshot) = map_plasma((ps, _, c) -> plasma_beta(c.ug, ps.bsq, snap.gam), snap)
+
+"""
     lapse(snap)
 
 Per-cell lapse α, as an array like `snap.fluid`.

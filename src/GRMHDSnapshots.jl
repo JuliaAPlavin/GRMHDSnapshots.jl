@@ -17,7 +17,7 @@ using ZarrZfp
 
 export GRMHDSnapshot, TensorGrid, BlockGrid, load_snapshot, resample, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
     plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit, eddington_mass_unit,
-    comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
+    comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization, plasma_beta
 
 include("coordinates.jl")
 
@@ -90,9 +90,9 @@ const SolarMass = Quantity{<:Real, dimension(u"Msun"), typeof(u"Msun")}
 # iharm3d/KHARMA, H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
 # `fluid` is an array of per-cell records, `(:φ,:θ,:r)` for a `TensorGrid`, `(:φ,:θ,:r,:block)` for a `BlockGrid`, with
-# the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B` (lab field B^i), vectors in Kerr-Schild components of the
-# grid's spherical coordinates; a partial load holds only the requested keys, in that order. One interleaved record per
-# cell: an interpolation reads each stencil corner from one place.
+# the keys `ρ` (density), `ug` (internal energy density, code units as ρ), `ũ` (relative 4-velocity ũ^i) and `B` (lab
+# field B^i), vectors in Kerr-Schild components of the grid's spherical coordinates; a partial load holds only the
+# requested keys, in that order. One interleaved record per cell: an interpolation reads each stencil corner from one place.
 # `grid` (a `TensorGrid` or a `BlockGrid`) places the cells of `fluid`.
 # `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
 # point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
@@ -118,8 +118,8 @@ Load a single GRMHD snapshot, auto-detecting the on-disk format:
 - a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` and `spin_axis` kwargs):
   the dump's native blocks on a [`BlockGrid`](@ref), which [`resample`](@ref) turns into the uniform grid.
 
-`kwargs...` go to the selected loader. Every loader accepts `fields` (a nonempty subset of `(:ρ, :ũ, :B)`) and
-`M_unit`/`MBH`; use the explicit loaders for their format-specific options.
+`kwargs...` go to the selected loader. Every loader accepts `fields` (a nonempty subset of `(:ρ, :ug, :ũ, :B)`, default
+`(:ρ, :ũ, :B)`) and `M_unit`/`MBH`; use the explicit loaders for their format-specific options.
 """
 function load_snapshot(path::AbstractString; kwargs...)
     p = rstrip(path, '/')
@@ -155,12 +155,12 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 # Arguments
 - `path`: `.h5` file, or `.../RUN.zarr/snapNNNN` store snapshot path.
 - `kwargs...`: Forwarded to the selected loader; both take `fields = (:ρ, :ũ, :B)` (the fluid fields to read, a
-  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (masses, e.g. `6.5e9u"Msun"`), each overriding the header's value
+  nonempty subset of `(:ρ, :ug, :ũ, :B)`) and `M_unit = nothing, MBH = nothing` (masses, e.g. `6.5e9u"Msun"`), each overriding the header's value
   independently. Without them the header units are used for radiative runs only, as described for the store method
   `load_koral(store, snapname)`.
 
 # Returns
-- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float64` for `.h5`,
+- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ug, ũ, B)`; `Float64` for `.h5`,
   `Float32` for Zarr.
 """
 function load_koral(path::AbstractString; kwargs...)
@@ -205,7 +205,7 @@ function load_koral_h5(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = n
     end
 end
 
-const _FLUID_KEYS = (:ρ, :ũ, :B)
+const _FLUID_KEYS = (:ρ, :ug, :ũ, :B)
 
 # The requested fluid fields in the canonical record order.
 function _fluid_keys(fields)
@@ -215,7 +215,7 @@ function _fluid_keys(fields)
 end
 
 # koral datasets of each fluid field
-const _KORAL_COMPONENTS = (ρ = ("rho",), ũ = ("U1", "U2", "U3"), B = ("B1", "B2", "B3"))
+const _KORAL_COMPONENTS = (ρ = ("rho",), ug = ("uint",), ũ = ("U1", "U2", "U3"), B = ("B1", "B2", "B3"))
 
 _koral_column(::Type, (a,)::Tuple{AbstractArray}) = a
 _koral_column(::Type{T}, cs::NTuple{3,AbstractArray}) where {T} = StructArrays.StructArray{SVector{3,T}}(cs)
@@ -253,7 +253,7 @@ Load one snapshot from an open Zarr run store.
 # Arguments
 - `store`: Open Zarr run store.
 - `snapname`: Snapshot group name, e.g. `"snap002000"`.
-- `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`.
+- `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ug, :ũ, :B)`.
 - `grid`: Cached grid from `load_grid(store)`.
 - `M_unit`, `MBH`: physical units (masses, e.g. `6.5e9u"Msun"`; stored in M☉), each overriding the header independently. Otherwise both come from the
   header if the run is radiative (`has_radiation` present and nonzero), else are `nothing`: as in ipole, the header
@@ -261,7 +261,7 @@ Load one snapshot from an open Zarr run store.
   (g/cm³), converted to a mass with r_g from its `M_bh`, so `rhounit` is that density.
 
 # Returns
-- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float32`.
+- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ug, ũ, B)`; `Float32`.
 """
 function load_koral(store::ZGroup, snapname::AbstractString;
                     fields = (:ρ, :ũ, :B), grid = load_grid(store), M_unit = nothing, MBH = nothing)
@@ -290,7 +290,7 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 [`GRMHDSnapshot`] that all downstream physics/interpolation handles unchanged.
 
 # Arguments
-- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
+- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ug, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ug, ũ, B)`.
 - `M_unit`, `MBH`: physical units (code mass unit, black-hole mass), masses (e.g. `6.5e9u"Msun"`; stored in M☉), each optional (default `nothing`). These
   dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
@@ -318,12 +318,12 @@ function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = noth
         r_prof  = Float64[first(bl_coord(coords, X1(i), X2(1))) for i in 1:n1]
         th_grid = Float64[last(bl_coord(coords, X1(i), X2(j)))  for i in 1:n1, j in 1:n2]
 
-        # prims: HDF5 (n1,n2,n3,n_prim) row-major → Julia (n_prim,n3,n2,n1). Slots: 1=RHO, 3-5=U1-3, 6-8=B1-3.
+        # prims: HDF5 (n1,n2,n3,n_prim) row-major → Julia (n_prim,n3,n2,n1). Slots: 1=RHO, 2=UU, 3-5=U1-3, 6-8=B1-3.
         prims = rd("prims")
         # native contravariant 3-vector → KS: v_KS = J₃·v_nat, J₃(r,θ) built once per (i,j) and reused over φ.
         J = [jacobian_spatial(coords, X1(i), X2(j)) for i in 1:n1, j in 1:n2]
         tovec(s, k, j, i) = J[i, j] * SVector(prims[s, k, j, i], prims[s + 1, k, j, i], prims[s + 2, k, j, i])
-        cellf = (ρ = (k, j, i) -> prims[1, k, j, i], ũ = (k, j, i) -> tovec(3, k, j, i), B = (k, j, i) -> tovec(6, k, j, i))
+        cellf = (ρ = (k, j, i) -> prims[1, k, j, i], ug = (k, j, i) -> prims[2, k, j, i], ũ = (k, j, i) -> tovec(3, k, j, i), B = (k, j, i) -> tovec(6, k, j, i))
         fluid = NamedDimsArray(_cellmap(cellf[ks], (n3, n2, n1)), (:φ, :θ, :r))
 
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
@@ -365,7 +365,7 @@ are placed at the standard cell centers of their block (see [`BlockGrid`](@ref))
   of `(1, 0, 0)`, `(-1, 0, 0)`, `(0, 1, 0)`, `(0, -1, 0)`, `(0, 0, 1)`; e.g. `(0, 0, 1)` for the EHT code-comparison
   run.
 - `rmin`, `rmax`: radial range; `nothing` extends to the grid edge.
-- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
+- `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ug, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ug, ũ, B)`.
 - `lazy`: `true` leaves the cells in the memory-mapped dump files and converts each one when it is read (same values),
   so nothing is held in memory per cell: for [`resample`](@ref) of dumps too large to load. Reading the same cell again
   converts it again.
@@ -405,7 +405,7 @@ end
 # precision. Nothing is held per cell; the geometry of the (θ, r) centres and (sin φ, cos φ) are held once per distinct
 # block footprint in (r, θ) and in φ, so blocks refined only in φ, or stacked along it, share them.
 function _hamr_records(cells, level, coord, startx, ext0, bs, coords, Rv, a, ks)
-    z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks]
+    z = (ρ = 0.0, ug = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks]
     E = typeof(z)
     Rec = typeof(map(x -> Float32.(x), z))
     R = _rotation(Rv)
@@ -433,8 +433,8 @@ function _tcollect(A)
     out
 end
 
-# `(; J, r, sθ, cθ)` at native (X1, X2) for `_hamr_ks`; `nothing` for ρ alone, which needs none.
-_hamr_center_geometry(::Type{<:NamedTuple{(:ρ,)}}, coords, X1, X2) = nothing
+# `(; J, r, sθ, cθ)` at native (X1, X2) for `_hamr_ks`; `nothing` for scalar fields only, which need none.
+_hamr_center_geometry(::Type{<:NamedTuple{<:Any, <:Tuple{Vararg{Real}}}}, coords, X1, X2) = nothing
 function _hamr_center_geometry(::Type, coords, X1, X2)
     r, θ = bl_coord(coords, X1, X2)
     sθ, cθ = sincos(θ)
@@ -459,11 +459,12 @@ end
 const HAMRCell = SVector{9,Float32}
 
 # Stored cell `p` with KS components at its center (geometry `gc`, (sin φ, cos φ) of its φ), as the record type `E` of
-# the requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by the static `K` keeps it
+# the requested fields. Only the selected thunks run (`gc` is `nothing` for scalars alone); selecting by the static `K` keeps it
 # type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column. ũ takes the spin-frame metric at the
 # center's spin-frame direction n.
 function _hamr_ks(p::HAMRCell, gc, (sφ, cφ), R, a, ::Type{E}) where {K, E<:NamedTuple{K}}
     fs = (ρ = () -> p[1],
+          ug = () -> p[2],
           ũ = () -> let n = R*SVector(gc.sθ*cφ, gc.sθ*sφ, gc.cθ)
               gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), _ks_gcov_sq(gc.r, n[3]^2, n[1]^2 + n[2]^2, a))
           end,
@@ -826,7 +827,7 @@ end
 
 # Grid vector components (r, θ, φ) → spin-frame ones at a point of spin-frame geometry `fr`: its unit direction n, and
 # eθ, eφs the spin-frame Cartesian vectors of the grid's ∂θ/r and ∂φ/r there. r is shared. On the spin axis θ′ is taken
-# along φ′ = atan(n[2], n[1]) ∈ {0, ±π} and the φ′ component, singular there, is 0. Scalars (ρ) are unchanged.
+# along φ′ = atan(n[2], n[1]) ∈ {0, ±π} and the φ′ component, singular there, is 0. Scalars (ρ, ug) are unchanged.
 @inline _tospin(x::Number, fr) = x
 @inline function _tospin(V::SVector{3}, fr)
     (; n, eθ, eφs) = fr
@@ -863,7 +864,7 @@ The fluid record at the spin-frame Cartesian position `(x, y, z)`: trilinearly i
 - `x`, `y`, `z`: spin-frame Cartesian coordinates in gravitational radii.
 
 # Returns
-- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, vectors in spin-frame Kerr-Schild components; on a
+- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ug, ũ, B)`, vectors in spin-frame Kerr-Schild components; on a
   `TensorGrid` in the grid precision (`eltype(snapshot.grid.r_prof)`), on a `BlockGrid` scalars in the fluid precision
   and vectors promoted to the point's; zeros of the same type outside the grid.
 """
