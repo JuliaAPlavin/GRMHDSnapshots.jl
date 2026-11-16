@@ -177,7 +177,7 @@ end
 # rather than compute with `nothing`.
 function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
     miss = filter(n -> getproperty(snap, n) === nothing, names)
-    units = (M_unit = "g", MBH = "M☉")
+    units = (M_unit = "M☉", MBH = "M☉")
     isempty(miss) || throw(ArgumentError("$f needs $(join(map(n -> "$n ($(units[n]))", miss), " and ")), missing from this snapshot; pass to the loader"))
 end
 
@@ -194,9 +194,9 @@ lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); _rg_cm(snap.MB
 """
     rhounit(snap)
 
-Code mass-density unit M_unit/r_g³ in g/cm³. Needs both `M_unit` and `MBH`.
+Code mass-density unit M_unit/r_g³ in g/cm³ (`M_unit` in M☉). Needs both `M_unit` and `MBH`.
 """
-rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); ustrip(u"g/cm^3", (snap.M_unit*u"g")/(lunit(snap)*u"cm")^3))
+rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); ustrip(u"g/cm^3", (Float64(snap.M_unit)*u"Msun")/(lunit(snap)*u"cm")^3))
 
 """
     bunit(snap)

@@ -21,7 +21,7 @@ export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_hamr, load_gri
 
 include("coordinates.jl")
 
-# `M_unit` (code mass unit, g) and `MBH` (black-hole mass, M☉ — fits Float32, unlike grams) each carry their own
+# `M_unit` (code mass unit) and `MBH` (black-hole mass), both in M☉ — fits Float32, unlike grams — each carry their own
 # type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
 # H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
@@ -93,7 +93,7 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 # Arguments
 - `path`: `.h5` file, or `.../RUN.zarr/snapNNNN` store snapshot path.
 - `kwargs...`: Forwarded to the selected loader; both take `fields = (:ρ, :ũ, :B)` (the fluid fields to read, a
-  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (g, M☉), each overriding the header's value
+  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (both M☉), each overriding the header's value
   independently. Without them the header units are used for radiative runs only, as described for the store method
   `load_koral(store, snapname)`.
 
@@ -108,13 +108,13 @@ function load_koral(path::AbstractString; kwargs...)
         load_koral(zopen(dirname(p), "r")::ZGroup, basename(p); kwargs...)
 end
 
-# Units (M_unit in g, MBH in M☉) of a koral snapshot: each keyword if given, else from the header if the run is
-# radiative, else `nothing`. The header's `M_unit` is KORAL's rhoGU2CGS(1), a density in g/cm³, turned into grams with
-# r_g from the header's `M_bh`; it and `M_bh` are real only for radiative runs (as in ipole): otherwise the run is
-# scale-free and they are placeholders. `hdr()` gives the header's `(; M_unit, M_bh)`, read only when used.
+# Units (M_unit, MBH, both in M☉) of a koral snapshot: each keyword if given, else from the header if the run is
+# radiative, else `nothing`. The header's `M_unit` is KORAL's rhoGU2CGS(1), a density in g/cm³, turned into a mass
+# (≈ M_bh: KORAL's mass unit) with r_g from the header's `M_bh`; it and `M_bh` are real only for radiative runs (as
+# in ipole): otherwise the run is scale-free and they are placeholders. `hdr()` gives the header's `(; M_unit, M_bh)`, read only when used.
 function _koral_units(radiative::Bool, hdr; M_unit, MBH)
     h = radiative ? hdr() : nothing
-    (M_unit = !isnothing(M_unit) ? M_unit : radiative ? h.M_unit*_rg_cm(h.M_bh)^3 : nothing,
+    (M_unit = !isnothing(M_unit) ? M_unit : radiative ? ustrip(u"Msun", h.M_unit*u"g/cm^3"*(_rg_cm(h.M_bh)*u"cm")^3) : nothing,
      MBH = !isnothing(MBH) ? MBH : radiative ? h.M_bh : nothing)
 end
 
@@ -192,10 +192,10 @@ Load one snapshot from an open Zarr run store.
 - `snapname`: Snapshot group name, e.g. `"snap002000"`.
 - `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`.
 - `grid`: Cached grid from `load_grid(store)`.
-- `M_unit`, `MBH`: physical units (g, M☉), each overriding the header independently. Otherwise both come from the
+- `M_unit`, `MBH`: physical units (both M☉), each overriding the header independently. Otherwise both come from the
   header if the run is radiative (`has_radiation` present and nonzero), else are `nothing`: as in ipole, the header
   units are real only for radiative runs, a scale-free run stores placeholders. The header's `M_unit` is a density
-  (g/cm³), converted to grams with r_g from its `M_bh`, so `rhounit` is that density.
+  (g/cm³), converted to a mass with r_g from its `M_bh`, so `rhounit` is that density.
 
 # Returns
 - `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float32`.
@@ -229,7 +229,7 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 
 # Arguments
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
-- `M_unit`, `MBH`: physical units, `M_unit` in grams and `MBH` in M☉, each optional (default `nothing`). These
+- `M_unit`, `MBH`: physical units (code mass unit, black-hole mass), both in M☉, each optional (default `nothing`). These
   dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
@@ -308,7 +308,7 @@ averaging. Stored values are used without correction, placed at the standard cel
 - `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
   each a nonnegative integer, or `nothing` for no cap.
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
-- `M_unit`, `MBH`: physical units (g, M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
+- `M_unit`, `MBH`: physical units (both M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.

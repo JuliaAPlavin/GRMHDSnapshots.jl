@@ -143,15 +143,18 @@ end
         @test s.MBH === Mbh_hdr
         @test rhounit(s) ≈ M_hdr rtol = 1e-12
         @test bunit(s) ≈ B_hdr rtol = 1e-6
+        # KORAL's mass unit is M_bh; they differ by the header's rounded constants. In M☉ it fits Float32.
+        @test s.M_unit ≈ 6.5e9 rtol = 1e-3
+        @test isfinite(Float32(s.M_unit))
         @test ld(; has_radiation = 1, MBH = 4e6).MBH === 4e6
         @test ld(; has_radiation = 1, MBH = 4e6).M_unit === s.M_unit
-        @test ld(; has_radiation = 1, M_unit = 1e26).M_unit === 1e26
-        @test ld(; has_radiation = 1, M_unit = 1e26).MBH === Mbh_hdr
+        @test ld(; has_radiation = 1, M_unit = 5e-8).M_unit === 5e-8
+        @test ld(; has_radiation = 1, M_unit = 5e-8).MBH === Mbh_hdr
         foreach((0, nothing)) do flag
             s = ld(; has_radiation = flag)
             @test s.M_unit === nothing && s.MBH === nothing
-            sk = ld(; has_radiation = flag, MBH = 6.5e9, M_unit = 1e26)
-            @test sk.MBH === 6.5e9 && sk.M_unit === 1e26
+            sk = ld(; has_radiation = flag, MBH = 6.5e9, M_unit = 5e-8)
+            @test sk.MBH === 6.5e9 && sk.M_unit === 5e-8
         end
     end
 
@@ -226,7 +229,7 @@ end
 
     store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
     # the fixture run is non-radiative, so scale-free: units given explicitly
-    snap = load_koral(store, "snap002000"; MBH = 6.5e9, M_unit = 1e26)
+    snap = load_koral(store, "snap002000"; MBH = 6.5e9, M_unit = 5e-8)
     a = snap.spin
 
     # Physical invariants of the reconstructed plasma state at sampled cells:
@@ -298,7 +301,7 @@ end
     @test map_plasma((_, _, c) -> c.ρ, snap) == map(c -> c.ρ, snap.fluid)
 
     # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no ρ needed.
-    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B), MBH = 6.5e9, M_unit = 1e26)
+    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B), MBH = 6.5e9, M_unit = 5e-8)
     @test !hasfield(eltype(snap_bv.fluid), :ρ)
     @test comoving_bsq(snap_bv) == bsqg
     @test comoving_B_gauss(snap_bv) == comoving_B_gauss(snap)
@@ -337,18 +340,19 @@ end
     @test snap0.M_unit === nothing && snap0.MBH === nothing
     @test_throws "lunit needs MBH (M☉)" lunit(snap0)
     unitsof(s) = map(f -> f(s), [lunit, rhounit, bunit])
-    @test snap.MBH === 6.5e9 && snap.M_unit === 1e26
+    @test snap.MBH === 6.5e9 && snap.M_unit === 5e-8
     @test unitsof(snap) isa Vector{Float64}
     @test lunit(snap) ≈ 9.598062747325812e14
-    @test rhounit(snap) ≈ 1e26/lunit(snap)^3
+    Msun_g = 1.98841e33                                         # M☉ in g, independent of the package's Unitful path
+    @test rhounit(snap) ≈ 5e-8*Msun_g/lunit(snap)^3 rtol = 1e-4
     @test bunit(snap) ≈ 2.99792458e10*sqrt(4π*rhounit(snap))
     # Float32 scalars (as after a whole-snapshot Float32 conversion) still give Float64 units, also where r_g³ in cm³
-    # or a large M_unit would overflow Float32.
+    # or a large M_unit in grams would overflow Float32.
     snap32 = setproperties(snap, map(Float32, (; snap.φ0, snap.dφ, snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH)))
     @test snap32.MBH isa Float32 && snap32.M_unit isa Float32
     @test unitsof(snap32) isa Vector{Float64}
     @test unitsof(snap32) ≈ unitsof(snap) rtol = 1e-6
-    @test unitsof(@set snap32.M_unit = 1f35) ≈ unitsof(@set snap.M_unit = 1e35) rtol = 1e-6
+    @test unitsof(@set snap32.M_unit = 1f10) ≈ unitsof(@set snap.M_unit = 1e10) rtol = 1e-6
 
     # Kernel type stability on Float64 inputs.
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
@@ -652,18 +656,19 @@ end
 
     # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
     @test_throws "lunit needs MBH (M☉)" lunit(snap)
-    foreach(f -> @test_throws("$f needs M_unit (g) and MBH (M☉)", f(snap)), (rhounit, bunit))
+    foreach(f -> @test_throws("$f needs M_unit (M☉) and MBH (M☉)", f(snap)), (rhounit, bunit))
     snapb = load_iharm(path; MBH = 6.5e9)
     @test snapb.M_unit === nothing
     @test lunit(snapb) ≈ 9.598062747325812e14
-    foreach(f -> @test_throws("$f needs M_unit (g)", f(snapb)), (rhounit, bunit))
-    snapm = load_iharm(path; M_unit = 1e26)
+    foreach(f -> @test_throws("$f needs M_unit (M☉)", f(snapb)), (rhounit, bunit))
+    snapm = load_iharm(path; M_unit = 5e-8)
     @test snapm.MBH === nothing
     foreach(f -> @test_throws("$f needs MBH (M☉)", f(snapm)), (lunit, rhounit, bunit))
     # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
-    snapbm = @set snapb.M_unit = 1e26
-    @test snapbm.M_unit === 1e26 && snapbm.fluid == snap.fluid
-    @test rhounit(snapbm) ≈ 1e26/lunit(snapb)^3 && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
+    snapbm = @set snapb.M_unit = 5e-8
+    @test snapbm.M_unit === 5e-8 && snapbm.fluid == snap.fluid
+    Msun_g = 1.98841e33                                         # M☉ in g, independent of the package's Unitful path
+    @test isapprox(rhounit(snapbm), 5e-8*Msun_g/lunit(snapb)^3; rtol = 1e-4) && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
     @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
     @test (@set snapbm.M_unit = nothing).M_unit === nothing
 
@@ -695,7 +700,7 @@ end
 
         # lazy units: scale-free by default ⇒ throw; supplied ⇒ positive scalars.
         @test_throws ArgumentError lunit(snap)
-        snapu = load_iharm(path; M_unit = 1e26, MBH = 6.5e9)
+        snapu = load_iharm(path; M_unit = 5e-8, MBH = 6.5e9)
         @test lunit(snapu) > 0 && rhounit(snapu) > 0 && bunit(snapu) > 0
         # auto-detect routes an FMKS .h5 to load_iharm.
         @test load_snapshot(path).fluid == snap.fluid
