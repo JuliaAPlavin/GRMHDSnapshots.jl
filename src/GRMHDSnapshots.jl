@@ -15,7 +15,7 @@ import Mmap
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
-export GRMHDSnapshot, TensorGrid, load_snapshot, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
+export GRMHDSnapshot, TensorGrid, BlockGrid, load_snapshot, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
     plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
@@ -36,14 +36,58 @@ end
 
 TensorGrid(r_prof, th_grid, φ0, dφ) = TensorGrid(r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ)
 
+"""
+    BlockGrid(coords, level, coord, nb, startx, ext0, r_extent)
+
+Block-structured AMR grid of `nb` level-0 blocks per direction (r, θ, φ) in the native coordinates `coords`, every block
+with the same cell counts `bs`, those of the fluid array `(φ, θ, r, block)`. Block `b` at level `l = level[b]` covers
+native `startx + coord[b]·ext0/2^l` to `startx + (coord[b] + 1)·ext0/2^l`; its 0-based cell `i` is centred at
+`startx + (coord[b]·bs + i + 1/2)·ext0/(bs·2^l)`. `sample` takes the nearest cell.
+"""
+struct BlockGrid{C, Tb, V, S, Re}
+    coords::C                 # native → Kerr-Schild map: HAMRSph() or a HAMRCyl
+    table::Tb                 # Int32 (r, θ, φ) block lattice at level `lmax`: the block owning each slot, 0 = none
+    lmax::SVector{3,Int32}
+    level::V                  # per block: refinement level per direction (r, θ, φ), SVector{3,Int32}
+    coord::V                  # per block: its position per direction, in units of its own size
+    startx::S                 # native coordinates of the grid's lower corner, SVector{3}
+    ext0::S                   # native extent of a level-0 block, SVector{3}
+    r_extent::Re              # radial interval with data; all blocks overlapping it are present
+end
+
+BlockGrid(coords, level, coord, nb, startx, ext0, r_extent) =
+    BlockGrid(coords, _block_table(level, coord, nb), _lmax(level), level, coord, startx, ext0, r_extent)
+
+# The finest level per direction.
+_lmax(level) = SVector{3,Int32}(ntuple(d -> maximum(l -> l[d], level), 3))
+
+# The block lattice at level `_lmax(level)` of `nb` level-0 blocks per direction, each block's slots painted with its index.
+function _block_table(level, coord, nb)
+    L = _lmax(level)
+    table = zeros(Int32, Tuple(nb .* 2 .^ L))
+    foreach(b -> table[ntuple(d -> _relevel(coord[b][d]:coord[b][d], L[d] - level[b][d]) .+ 1, 3)...] .= b, eachindex(level))
+    table
+end
+
+# Native centre of the 0-based cell `i` at level `l` in one direction: level-0 blocks of extent `e` and `n` cells from `x0`.
+_cell_center(x0, e, n, l, i) = x0 + (2i + 1)*(e/(2(n << l)))
+
+# Native cell centres per direction (r, θ, φ) of a block at level `l` and position `c`, of `bs` cells per direction.
+_block_centers(startx, ext0, l, c, bs) =
+    map((x0, e, l, c, n) -> map(i -> _cell_center(x0, e, n, l, c*n + i), 0:n-1), Tuple(startx), Tuple(ext0), Tuple(l), Tuple(c), bs)
+
+# 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
+_relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
+
 # `M_unit` (code mass unit) and `MBH` (black-hole mass), both in M☉ — fits Float32, unlike grams — each carry their own
 # type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
 # H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
-# `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
-# (lab field B^i), vectors in Kerr-Schild components of the grid's spherical coordinates; a partial load holds only the
-# requested keys, in that order. One interleaved record per cell: an interpolation reads each stencil corner from one place.
-# `grid` (a `TensorGrid`) places the cells of `fluid`.
+# `fluid` is an array of per-cell records, `(:φ,:θ,:r)` for a `TensorGrid`, `(:φ,:θ,:r,:block)` for a `BlockGrid`, with
+# the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B` (lab field B^i), vectors in Kerr-Schild components of the
+# grid's spherical coordinates; a partial load holds only the requested keys, in that order. One interleaved record per
+# cell: an interpolation reads each stencil corner from one place.
+# `grid` (a `TensorGrid` or a `BlockGrid`) places the cells of `fluid`.
 # `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
 # point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
 # `sample` and the grid maps return vectors in spin-frame Kerr-Schild components.
@@ -400,9 +444,6 @@ _hamr_cells(b, bs, d) = b.coord[d]*bs[d] .+ (0:bs[d]-1)
 # 0-based output radial cells, at target levels `tl`, overlapping block `b`.
 _hamr_outcells(b, bs, tl) = _relevel(_hamr_cells(b, bs, 1), tl[1] - b.level[1])
 
-# 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
-_relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
-
 # Spatial Jacobian, r and (sin θ, cos θ) at the stored cell centers, computed once per (r level, θ level, i, j) the blocks
 # need: for each (r level, θ level), the 0-based first cells (i0, j0) and the matrix of (; J, r, sθ, cθ) from there.
 function _hamr_cell_geometry(blocks, par, coords, tl, ir)
@@ -628,6 +669,7 @@ r_max(s::GRMHDSnapshot) = rightendpoint(r_extent(s.grid))
 # at the grid-frame Cartesian point q in grid components, or `nothing` outside the grid; `_grid_zero(grid, fluid)`, the
 # out-of-grid record, of the type `_grid_sample` returns inside; `_map_cells(f, grid, snap, foreach_r)`.
 r_extent(g::TensorGrid) = g.r_extent
+r_extent(g::BlockGrid) = g.r_extent
 
 # GPU-safe searchsortedlast.
 @inline function bsearchlast(a, x)
@@ -697,6 +739,32 @@ end
 # `_lerp` with a weight promotes the zero to the interpolated type (Float32 field → Float64).
 @inline _grid_zero(g::TensorGrid, A) = (z0 = _zero(eltype(A)); _lerp(z0, z0, one(eltype(g.r_prof))))
 
+# x mod 2π in x's own precision.
+@inline _wrap2π(x) = (t = 2*oftype(x, π); x - t*floor(x/t))
+
+# 0-based index of the cell of size h holding offset x, minus o, clamped into 0:n-1.
+@inline _cell_index(x, h, o, n) = clamp(unsafe_trunc(Int, floor(x/h)) - o, 0, n - 1)
+
+# Nearest cell: the record of the cell holding q, its indices clamped into the block (points beyond the θ range, round-off
+# at block faces). `nothing` also for a slot without a block.
+@inline function _grid_sample(g::BlockGrid, A, q)
+    r = sqrt(q[1]^2 + q[2]^2 + q[3]^2)
+    (r < leftendpoint(r_extent(g)) || r > rightendpoint(r_extent(g))) && return nothing
+    # not `hypot`: Base computes it for Float32 in Float64
+    X1, X2 = native_coord(g.coords, r, atan(sqrt(q[1]^2 + q[2]^2), q[3]))
+    x = (X1 - g.startx[1], X2 - g.startx[2], _wrap2π(atan(q[2], q[1]) - g.startx[3]))
+    e = Tuple(g.ext0)
+    s = map((xd, ed, L, n) -> _cell_index(xd, ed/(1 << L), 0, n), x, e, Tuple(g.lmax), size(g.table))
+    b = @inbounds g.table[(s .+ 1)...]
+    iszero(b) && return nothing
+    l = @inbounds g.level[b]; c = @inbounds g.coord[b]
+    bs = (size(A, 3), size(A, 2), size(A, 1))
+    i, j, k = map((xd, ed, ld, cd, n) -> _cell_index(xd, ed/(n << ld), cd*n, n), x, e, Tuple(l), Tuple(c), bs)
+    @inbounds A[k+1, j+1, i+1, b]
+end
+
+_grid_zero(g::BlockGrid, A) = _zero(eltype(A))
+
 _rotation(::Val{M}) where {M} = M
 
 # (cos φ, sin φ) of p's azimuth and its cylindrical radius; on the z axis φ = atan(p[2], p[1]) ∈ {0, ±π} by the signs
@@ -722,6 +790,10 @@ end
     SVector(V[1], vθ, vφ)
 end
 
+# The zero of the type `_tospin` gives at the spin-frame point p (its frame is in p's precision).
+@inline _tospin_zero(x::Number, p) = x
+@inline _tospin_zero(V::SVector{3}, p) = zero(SVector{3,promote_type(eltype(V), eltype(p))})
+
 # Geometry `(; r, n, eθ, eφs)` for `_tospin` at the spin-frame point p = R·q, from Cartesian coordinates (no trig: acos
 # loses accuracy near the axis)
 @inline function _sample_frame(R, p, q)
@@ -733,15 +805,17 @@ end
 """
     sample(snapshot, x, y, z)
 
-Trilinearly interpolate the fluid record at the spin-frame Cartesian position `(x, y, z)`, field by field.
+The fluid record at the spin-frame Cartesian position `(x, y, z)`: trilinearly interpolated field by field on a
+[`TensorGrid`](@ref), the nearest cell's on a [`BlockGrid`](@ref).
 
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`, with any subset of the fluid fields.
 - `x`, `y`, `z`: spin-frame Cartesian coordinates in gravitational radii.
 
 # Returns
-- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, vectors in spin-frame Kerr-Schild components, in the
-  grid precision (`eltype(snapshot.grid.r_prof)`); zeros outside the grid.
+- Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, vectors in spin-frame Kerr-Schild components; on a
+  `TensorGrid` in the grid precision (`eltype(snapshot.grid.r_prof)`), on a `BlockGrid` scalars in the fluid precision
+  and vectors promoted to the point's; zeros of the same type outside the grid.
 """
 @inline function sample(s::GRMHDSnapshot, x, y, z)
     R = _rotation(s.R)
@@ -749,7 +823,7 @@ Trilinearly interpolate the fluid record at the spin-frame Cartesian position `(
     q = R'*p
     v = _grid_sample(s.grid, s.fluid, q)
     # Not converted: the frame is NaN at r = 0.
-    v === nothing && return _grid_zero(s.grid, s.fluid)
+    v === nothing && return map(c -> _tospin_zero(c, p), _grid_zero(s.grid, s.fluid))
     fr = _sample_frame(R, p, q)
     map(c -> _tospin(c, fr), v)
 end
@@ -758,6 +832,9 @@ include("physics.jl")
 
 Adapt.adapt_structure(to, g::TensorGrid) =
     TensorGrid(Adapt.adapt(to, g.r_prof), g.r_extent, Adapt.adapt(to, g.th_grid), g.φ0, g.dφ)
+
+Adapt.adapt_structure(to, g::BlockGrid) = BlockGrid(g.coords, Adapt.adapt(to, g.table), g.lmax,
+    Adapt.adapt(to, g.level), Adapt.adapt(to, g.coord), g.startx, g.ext0, g.r_extent)
 
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
     Adapt.adapt(to, s.fluid), Adapt.adapt(to, s.grid), s.R, s.spin, s.gam, s.t, s.M_unit, s.MBH)

@@ -1034,6 +1034,179 @@ end
     end
 end
 
+@testitem "BlockGrid: nearest-cell lookup on a synthetic AMR grid" begin
+    using StaticArrays, NamedDims, Adapt
+    using GRMHDSnapshots: sample, HAMRSph, HAMRCyl, bl_coord, native_coord, _block_table, _grid_sample, _tospin,
+        _sample_frame, r_extent
+    using GRMHDSnapshots.IntervalSets: Interval
+
+    # native_coord inverts bl_coord; no point lookup through cylindrified θ
+    for X1 in (log(2.0), 1.0, 4.5), X2 in (-0.99, -0.3, 0.0, 0.7)
+        @test all(isapprox.(native_coord(HAMRSph(), bl_coord(HAMRSph(), X1, X2)...), (X1, X2); atol = 1e-14))
+    end
+    @test native_coord(HAMRSph(), 2f0, 1f0) isa Tuple{Float32,Float32}
+    cyl = HAMRCyl(startx1 = 0.19325057145871735, x10 = log(24.32), x20 = -1 + 1/1056)
+    @test_throws "resample" native_coord(cyl, 5.0, 1.0)
+
+    # 2×2×2 level-0 blocks of 4×3×5 cells (r, θ, φ); blocks (1, 0, 1) and (0, 1, 0) replaced by their children at levels
+    # (1, 1, 0) and (1, 1, 2)
+    nb = (2, 2, 2); bs = (4, 3, 5)
+    lv(t...) = SVector{3,Int32}(t)
+    base = [lv(a, b, c) for a in 0:1 for b in 0:1 for c in 0:1 if (a, b, c) ∉ ((1, 0, 1), (0, 1, 0))]
+    kids1 = [lv(2 + a, b, 1) for a in 0:1 for b in 0:1]
+    kids2 = [lv(a, 2 + b, c) for a in 0:1 for b in 0:1 for c in 0:3]
+    coord = [base; kids1; kids2]
+    level = [fill(lv(0, 0, 0), length(base)); fill(lv(1, 1, 0), 4); fill(lv(1, 1, 2), 16)]
+    nblk = length(coord)
+    startx = SVector(log(2.0), -0.9, 0.3); ext0 = SVector((log(100.0) - log(2.0))/2, 0.9, π)
+    g = BlockGrid(HAMRSph(), level, coord, nb, startx, ext0, Interval(2.0, 100.0))
+    # records encoding (block, cell), cells 0-based
+    rec(b, i, j, k) = (ρ = 1000.0b + 100i + 10j + k, ũ = SVector(0.01b, 0.02i - 0.03, 0.01j + 0.001k),
+                       B = SVector(0.1k, -0.05b, 0.2i*j + 0.25))
+    fluid = NamedDimsArray([rec(b, i, j, k) for k in 0:bs[3]-1, j in 0:bs[2]-1, i in 0:bs[1]-1, b in 1:nblk], (:φ, :θ, :r, :block))
+    I3 = Val(one(SMatrix{3,3,Int}))
+    snap = GRMHDSnapshot(fluid, g, I3, 0.9, 4/3, 0.0, nothing, nothing)
+    @test r_extent(g) == Interval(2.0, 100.0) && (r_min(snap), r_max(snap)) == (2.0, 100.0)
+
+    # the table: every slot owned by exactly the block whose box holds it
+    @test g.lmax === lv(1, 1, 2)
+    @test size(g.table) == (4, 4, 8) && eltype(g.table) == Int32 && _block_table(level, coord, nb) == g.table
+    owners(s) = findall(b -> all(d -> coord[b][d] == s[d] >> (g.lmax[d] - level[b][d]), 1:3), eachindex(coord))
+    @test all(I -> owners(Tuple(I) .- 1) == [g.table[I]], CartesianIndices(g.table))
+
+    # independent reference geometry: block box, cell size, native → grid Cartesian
+    h(b) = ext0 ./ (SVector(bs) .* 2 .^ level[b])
+    lo(b) = startx .+ coord[b] .* ext0 ./ 2 .^ level[b]
+    cart(X) = (r = exp(X[1]); θ = π/2*(1 + X[2]); r*SVector(sin(θ)*cos(X[3]), sin(θ)*sin(X[3]), cos(θ)))
+    # the cell holding native X (X3 wrapped), by brute force over the blocks
+    function ref(X)
+        Xw = SVector(X[1], X[2], startx[3] + mod(X[3] - startx[3], 2π))
+        b = only(filter(b -> all(lo(b) .≤ Xw .< lo(b) .+ ext0 ./ 2 .^ level[b]), 1:nblk))
+        (b, Int.(floor.((Xw .- lo(b)) ./ h(b)))...)
+    end
+    # with R = I the vectors only pass through `_tospin`
+    expect(q, b, i, j, k) = map(c -> _tospin(c, _sample_frame(one(SMatrix{3,3,Int}), q, q)), fluid[k+1, j+1, i+1, b])
+
+    # every cell centre, and points jittered inside the cell, give that cell; φ > π among them (atan's negative branch)
+    cells = [(b, i, j, k) for b in 1:nblk for i in 0:bs[1]-1 for j in 0:bs[2]-1 for k in 0:bs[3]-1]
+    offs = [zero(SVector{3}); vec([SVector(a, c, d) for a in (-0.45, 0.45), c in (-0.45, 0.45), d in (-0.45, 0.45)])]
+    centre(b, i, j, k) = lo(b) .+ (SVector(i, j, k) .+ 0.5) .* h(b)
+    at(b, i, j, k, o) = cart(centre(b, i, j, k) .+ o .* h(b))
+    for (b, i, j, k) in cells
+        @test all(o -> (q = at(b, i, j, k, o); sample(snap, q...) == expect(q, b, i, j, k)), offs)
+    end
+    (b, i, j, k) = cells[100]
+    @test _grid_sample(g, fluid, at(b, i, j, k, zero(SVector{3}))) === fluid[k+1, j+1, i+1, b]
+    @test any(c -> centre(c...)[3] > π, cells)
+    @test all(c -> ref(centre(c...)) == c, cells)
+
+    # φ periodicity: φ ± 2π is the same cell
+    for (b, i, j, k) in cells[1:7:end]
+        @test all(s -> sample(snap, cart(centre(b, i, j, k) + SVector(0, 0, s))...).ρ == fluid[k+1, j+1, i+1, b].ρ, (-2π, 2π))
+    end
+
+    # beyond the θ range (near both poles, and on the axis): the first/last θ cell
+    for r in (3.0, 10.0, 60.0), φ in (1.0, 4.0, -2.5), (θ, X2) in ((0.05, -0.9 + 1e-9), (π - 0.05, 0.9 - 1e-9))
+        q = r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ))
+        @test sample(snap, q...) == expect(q, ref(SVector(log(r), X2, φ))...)
+    end
+    for r in (3.0, 60.0), z in (r, -r)
+        q = SVector(0.0, 0.0, z)
+        @test sample(snap, q...) == expect(q, ref(SVector(log(r), z > 0 ? -0.9 + 1e-9 : 0.9 - 1e-9, 0.0))...)
+    end
+
+    # outside r_extent: zeros
+    Z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))
+    @test all(p -> sample(snap, p...) === Z, [(1.5, 0.0, 0.0), (0.0, 0.0, -1.9), (150.0, 1.0, 2.0), (0.0, 0.0, 0.0)])
+
+    # type-stable and allocation-free
+    q = at(cells[500]..., zero(SVector{3}))
+    @inferred sample(snap, q...)
+    @inferred sample(snap, 0.0, 0.0, 1000.0)
+    alloc(s, q) = @allocated sample(s, q...)
+    alloc(snap, q)
+    @test alloc(snap, q) == 0
+
+    # all-Float32: computed in Float32, no promotion
+    names = (:φ, :θ, :r, :block)
+    fluid32 = NamedDimsArray(map(c -> map(x -> Float32.(x), c), parent(fluid)), names)
+    g32 = BlockGrid(HAMRSph(), level, coord, nb, Float32.(startx), Float32.(ext0), Interval(2f0, 100f0))
+    snap32 = GRMHDSnapshot(fluid32, g32, I3, 0.9f0, Float32(4/3), 0f0, nothing, nothing)
+    RT32 = @NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}
+    @test @inferred(sample(snap32, Float32.(q)...)) isa RT32
+    @test @inferred(sample(snap32, 0f0, 0f0, 1f3)) isa RT32
+    @test !occursin("Float64", string(code_typed(_grid_sample, Tuple{typeof(g32), typeof(fluid32), SVector{3,Float32}})))
+    alloc(snap32, Float32.(q))
+    @test alloc(snap32, Float32.(q)) == 0
+    for (b, i, j, k) in cells
+        @test sample(snap32, Float32.(at(b, i, j, k, zero(SVector{3})))...).ρ == fluid[k+1, j+1, i+1, b].ρ
+    end
+
+    # Adapt round trip
+    sa = Adapt.adapt(Array, snap)
+    @test sa.grid.table == g.table && sa.grid.lmax === g.lmax && sa.grid.level == level && sa.grid.coord == coord
+    @test sa.grid.startx === startx && sa.grid.ext0 === ext0 && sa.grid.r_extent === g.r_extent && sa.grid.coords === g.coords
+    @test parent(sa.fluid) == parent(fluid) && dimnames(sa.fluid) == names
+    @test sample(sa, q...) === sample(snap, q...)
+
+    # a cylindrified BlockGrid has no point lookup
+    @test_throws "resample" sample(GRMHDSnapshot(fluid, BlockGrid(cyl, level, coord, nb, startx, ext0, Interval(2.0, 100.0)),
+                                                 I3, 0.9, 4/3, 0.0, nothing, nothing), q...)
+end
+
+@testitem "BlockGrid: grid maps equal the TensorGrid ones at one level; sample zeros typed as inside" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: sample, HAMRSph, bl_coord
+    using GRMHDSnapshots.IntervalSets: Interval
+
+    # a level-0 grid of 2×2×2 blocks of 4×3×5 cells as one tensor grid, centres by the same expression as the blocks'
+    nb = (2, 2, 2); bs = (4, 3, 5); n = nb .* bs
+    startx = SVector(log(2.0), -0.9, 0.3); ext0 = SVector((log(100.0) - log(2.0))/2, 0.9, π)
+    cen(d, i) = startx[d] + (2i + 1)*(ext0[d]/(2bs[d]))
+    r_prof = map(i -> first(bl_coord(HAMRSph(), cen(1, i), cen(2, 0))), 0:n[1]-1)
+    th_grid = [last(bl_coord(HAMRSph(), cen(1, i), cen(2, j))) for i in 0:n[1]-1, j in 0:n[2]-1]
+    tg = TensorGrid(r_prof, th_grid, cen(3, 0), ext0[3]/bs[3])
+    T = [(ρ = 1.0 + i + 0.1j + 0.01k, ũ = SVector(0.1sin(i + j), 0.01cos(k), 0.003j),
+          B = SVector(1.0 + 0.1k, 0.02sin(i + k), 0.01j)) for k in 0:n[3]-1, j in 0:n[2]-1, i in 0:n[1]-1]
+    coord = vec([SVector{3,Int32}(a, b, c) for a in 0:1, b in 0:1, c in 0:1])
+    level = fill(zero(SVector{3,Int32}), length(coord))
+    blk(A, c) = A[c[3]*bs[3] .+ (1:bs[3]), c[2]*bs[2] .+ (1:bs[2]), c[1]*bs[1] .+ (1:bs[1])]
+    toblocks(A) = stack(c -> blk(A, c), coord)
+    bg = BlockGrid(HAMRSph(), level, coord, nb, startx, ext0, tg.r_extent)
+    tnames = (:φ, :θ, :r); bnames = (:φ, :θ, :r, :block)
+    mk(A, grid, R = Val(one(SMatrix{3,3,Int}))) =
+        GRMHDSnapshot(NamedDimsArray(A, ndims(A) == 3 ? tnames : bnames), grid, R, 0.9, 4/3, 0.0, nothing, nothing)
+
+    # r and θ of every cell are bit-identical; φ = φ0 + (k−1)·dφ from each block's own φ0 differs from the tensor one by
+    # round-off, so maps depending on φ (any of them with a turned R, the vector ones always) agree to round-off only
+    Rx = Val(SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0))
+    @test parent(volume_ratio(mk(toblocks(T), bg))) == toblocks(parent(volume_ratio(mk(T, tg))))
+    for R in (Val(one(SMatrix{3,3,Int})), Rx)
+        st, sb = mk(T, tg, R), mk(toblocks(T), bg, R)
+        for f in (s -> map_plasma((ps, _, _) -> ps.bsq, s), s -> map_plasma((ps, _, _) -> ps.u, s),
+                  s -> map_plasma((_, g, c) -> (g, c.B), s), flow_speed, volume_ratio)
+            ot, ob = f(st), f(sb)
+            @test dimnames(ob) == bnames && size(ob) == (5, 3, 4, 8)
+            @test all(map((x, y) -> all(isapprox.(x, y; rtol = 1e-13)), parent(ob), toblocks(parent(ot))))
+        end
+        @test map_plasma((ps, _, _) -> ps.bsq, sb; threaded = true) == map_plasma((ps, _, _) -> ps.bsq, sb; threaded = false)
+        @inferred flow_speed(sb)
+    end
+
+    # out-of-grid zeros have the in-grid type: Float32 fluid with Float64 grid and point, and all Float32; both grid kinds
+    f32(A) = map(c -> map(x -> Float32.(x), c), A)
+    tg32 = TensorGrid(Float32.(r_prof), Float32.(th_grid), Float32(tg.φ0), Float32(tg.dφ))
+    bg32 = BlockGrid(HAMRSph(), level, coord, nb, Float32.(startx), Float32.(ext0),
+                     Interval(Float32(first(r_prof)), Float32(last(r_prof))))
+    for (grid, grid32, A) in ((tg, tg32, T), (bg, bg32, toblocks(T))),
+        (s, P) in ((mk(f32(A), grid), Float64), (mk(f32(A), grid32), Float32))
+        vi = @inferred sample(s, P.((5.0, 1.0, 2.0))...)
+        vo = @inferred sample(s, P.((0.0, 0.0, 1000.0))...)
+        @test typeof(vi) == typeof(vo) && eltype(vi.ũ) == eltype(vi.B) == P
+        @test vo == map(zero, vi)
+    end
+end
+
 @testitem "_" begin
     import Aqua
     Aqua.test_all(GRMHDSnapshots; ambiguities=false)

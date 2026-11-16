@@ -127,3 +127,8 @@ struct HAMRSph end
 
 @inline bl_coord(::HAMRSph, X1, X2) = (exp(X1), _hamr_th0(X2))
 @inline jacobian_spatial(::HAMRSph, X1, X2) = Diagonal(SVector(exp(X1), π/2, 1))
+
+# Inverse of `bl_coord`: native (X1, X2) at KS (r, θ).
+@inline native_coord(::HAMRSph, r, θ) = (log(r), 2θ/π - 1)
+native_coord(::HAMRCyl, r, θ) = throw(ArgumentError(
+    "point lookup on a cylindrified H-AMR grid is not supported: `resample` it to a TensorGrid"))
