@@ -287,14 +287,13 @@ end
                                              snap.grid.r_prof[i], snap.grid.th_grid[i, j], a).bsq
 
     # map_plasma hoists the (r,θ)-only metric across φ and threads over r: over the whole grid it must
-    # match a naive per-cell reconstruction (independent reference) up to FMA reassociation, and its
-    # result must be bit-identical regardless of thread count.
+    # match a naive per-cell reconstruction (independent reference) up to FMA reassociation, and the
+    # threaded cell map must be bit-identical to the serial one (each cell's record and geometry).
     nφ, nθ, nr = size(snap.fluid)
     bsq_ref = [plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B,
                             snap.grid.r_prof[i], snap.grid.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
-    @test map_plasma((ps, _, _) -> ps.bsq, snap; threaded = true) ==
-          map_plasma((ps, _, _) -> ps.bsq, snap; threaded = false)
+    @test GRMHDSnapshots._map_cells(tuple, snap) == GRMHDSnapshots._map_cells(tuple, snap, foreach)
     @inferred comoving_bsq(snap)
 
     # map_plasma's kernel gets the cell's record
@@ -1180,7 +1179,7 @@ end
             @test parent(rl.fluid) isa Array && parent(rl.fluid) == parent(re.fluid) && grideq(rl.grid, re.grid)
         end
         @test any(d -> size(resample(l; maxlevel = cap).fluid, d) < size(resample(l).fluid, d), 1:3)
-        # grid maps, threaded and serial
+        # grid maps read the lazy cells concurrently: the same as on the eager copy
         @test comoving_bsq(l) == comoving_bsq(e)
         @test flow_speed(l) == flow_speed(e)
         (e, l)
@@ -1371,7 +1370,7 @@ end
             @test dimnames(ob) == bnames && size(ob) == (5, 3, 4, 8)
             @test all(map((x, y) -> all(isapprox.(x, y; rtol = 1e-13)), parent(ob), toblocks(parent(ot))))
         end
-        @test map_plasma((ps, _, _) -> ps.bsq, sb; threaded = true) == map_plasma((ps, _, _) -> ps.bsq, sb; threaded = false)
+        @test GRMHDSnapshots._map_cells(tuple, sb) == GRMHDSnapshots._map_cells(tuple, sb, foreach)
         @inferred flow_speed(sb)
     end
 
