@@ -1156,6 +1156,66 @@ end
     end
 end
 
+@testitem "H-AMR loader: lazy = true, real data (optional, isfile-guarded)" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: sample
+
+    same(L, A) = all(I -> L[I] === A[I], CartesianIndices(A))
+    grideq(a, b) = typeof(a) == typeof(b) && all(f -> getfield(a, f) == getfield(b, f), fieldnames(typeof(a)))
+    # the lazy load against the eager one: `ld(; kw...)` loads a small radial range, `cap` is a `maxlevel` below its levels
+    function check(ld, cap)
+        e = ld(); l = ld(lazy = true)
+        A = parent(e.fluid); L = parent(l.fluid)
+        @test A isa Array && !(L isa Array) && L isa AbstractArray{eltype(A),4} && size(L) == size(A)
+        @test dimnames(l.fluid) == (:φ, :θ, :r, :block)
+        @test grideq(l.grid, e.grid) && (l.R, l.spin, l.gam, l.t, l.M_unit, l.MBH) === (e.R, e.spin, e.gam, e.t, e.M_unit, e.MBH)
+        # every cell: the same conversion, done when read
+        @test same(L, A)
+        ep = ld(fields = (:B, :ρ)); lp = ld(fields = (:B, :ρ), lazy = true)
+        @test !(parent(lp.fluid) isa Array) && eltype(lp.fluid) == @NamedTuple{ρ::Float32, B::SVector{3,Float32}}
+        @test same(parent(lp.fluid), parent(ep.fluid))
+        # resample reads the cells it needs; copies and averages are the same
+        for maxlevel in ((;), cap)
+            rl = resample(l; maxlevel); re = resample(e; maxlevel)
+            @test parent(rl.fluid) isa Array && parent(rl.fluid) == parent(re.fluid) && grideq(rl.grid, re.grid)
+        end
+        @test any(d -> size(resample(l; maxlevel = cap).fluid, d) < size(resample(l).fluid, d), 1:3)
+        # grid maps, threaded and serial
+        @test comoving_bsq(l) == comoving_bsq(e)
+        @test flow_speed(l) == flow_speed(e)
+        (e, l)
+    end
+
+    # new layout, across the ring edge r = 3.7751…: levels (0, 0, 1) and up to (1, 1, 1)
+    dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
+    if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
+        kw = (rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 3.6, rmax = 3.81)
+        e, l = check((; k...) -> load_hamr(dir; kw..., k...), (r = 0, φ = 0))
+        # nearest-cell lookup, inside and outside the radial range
+        R = SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0)
+        pts = [R*(r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ))) for r in range(3.5, 3.9, 9), θ in range(0.02, 3.12, 7), φ in range(-3, 3, 6)]
+        @test count(p -> sample(e, p...).ρ > 0, pts) > 200
+        @test all(p -> sample(l, p...) === sample(e, p...), pts)
+        @inferred sample(l, pts[100]...)
+        # load_snapshot passes the keyword on
+        sl = load_snapshot(dir; kw..., lazy = true)
+        @test !(parent(sl.fluid) isa Array) && same(parent(sl.fluid), parent(e.fluid))
+    else
+        @test_skip "H-AMR new-layout dump dir or gdumps absent"
+    end
+
+    # old layout, cylindrified θ: the innermost ring of blocks, φ levels 0–4
+    odir = joinpath(@__DIR__, "data", "hamr_dumps1000")
+    if isfile(joinpath(odir, "parameters"))
+        kw = (rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235)
+        e, _ = check((; k...) -> load_hamr(odir; kw..., k...), (φ = 2,))
+        sl = load_snapshot(odir; kw..., lazy = true)
+        @test !(parent(sl.fluid) isa Array) && same(parent(sl.fluid), parent(e.fluid))
+    else
+        @test_skip "H-AMR dump dir absent"
+    end
+end
+
 @testitem "BlockGrid: nearest-cell lookup on a synthetic AMR grid" begin
     using StaticArrays, NamedDims, Adapt
     using GRMHDSnapshots: sample, HAMRSph, HAMRCyl, bl_coord, native_coord, _block_table, _grid_sample, _tospin,
@@ -1401,6 +1461,63 @@ end
     @test_throws "maxlevel keys" resample(s2; maxlevel = (z = 1,))
     @test_throws "nonnegative integers" resample(s2; maxlevel = (r = -1,))
     @test_throws ArgumentError resample(s2; maxlevel = (θ = 1.5,))
+end
+
+@testitem "H-AMR lazy records on synthetic blocks" begin
+    using StaticArrays
+    using GRMHDSnapshots: HAMRSph, HAMRCyl, HAMRCell, _hamr_records, _shared, _tcollect, _block_centers, _hamr_center_geometry,
+        _hamr_ks, _hamr_rotation, _rotation
+
+    # the layout of the nearest-cell testitem: 2×2×2 level-0 blocks of 4×3×5 cells (r, θ, φ); blocks (1, 0, 1) and (0, 1, 0)
+    # replaced by their children at levels (1, 1, 0) and (1, 1, 2)
+    bs = (4, 3, 5)
+    lv(t...) = SVector{3,Int32}(t)
+    base = [lv(a, b, c) for a in 0:1 for b in 0:1 for c in 0:1 if (a, b, c) ∉ ((1, 0, 1), (0, 1, 0))]
+    kids1 = [lv(2 + a, b, 1) for a in 0:1 for b in 0:1]
+    kids2 = [lv(a, 2 + b, c) for a in 0:1 for b in 0:1 for c in 0:3]
+    coord = [base; kids1; kids2]
+    level = [fill(lv(0, 0, 0), length(base)); fill(lv(1, 1, 0), 4); fill(lv(1, 1, 2), 16)]
+    nblk = length(coord)
+    startx = SVector(log(2.0), -0.9, 0.3); ext0 = SVector((log(100.0) - log(2.0))/2, 0.9, π)
+    a = 0.9
+    Rv = _hamr_rotation((-1, 0, 0)); R = _rotation(Rv)
+    # stored cells as the loader has them: per block, a view of one (φ, θ, r, block) array
+    stored = rand(HAMRCell, reverse(bs)..., nblk)
+    cells = map(b -> view(stored, :, :, :, b), 1:nblk)
+    cyl = HAMRCyl(startx1 = 0.19325057145871735, x10 = log(24.32), x20 = -1 + 1/1056)
+    alloc(A, k, j, i, b) = @allocated A[k, j, i, b]
+
+    for coords in (HAMRSph(), cyl), ks in ((:ρ, :ũ, :B), (:ρ,), (:B,), (:ρ, :ũ))
+        E = typeof((ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks])
+        Rec = typeof((ρ = 0f0, ũ = zero(SVector{3,Float32}), B = zero(SVector{3,Float32}))[ks])
+        A = _hamr_records(cells, level, coord, startx, ext0, bs, coords, Rv, a, ks)
+        @test A isa AbstractArray{Rec,4} && !(A isa Array) && size(A) == (reverse(bs)..., nblk)
+
+        # reference: each cell converted on its own, at its block's centres
+        ref = stack(1:nblk) do b
+            X1s, X2s, X3s = _block_centers(startx, ext0, level[b], coord[b], bs)
+            [convert(Rec, _hamr_ks(ltoh.(stored[k, j, i, b]), _hamr_center_geometry(E, coords, X1s[i], X2s[j]), sincos(X3s[k]), R, a, E))
+             for k in 1:bs[3], j in 1:bs[2], i in 1:bs[1]]
+        end
+        @test all(I -> A[I] === ref[I], CartesianIndices(ref))
+        # type-stable and allocation-free element read
+        @test @inferred(A[2, 3, 1, 9]) === ref[2, 3, 1, 9]
+        alloc(A, 2, 3, 1, 9)
+        @test alloc(A, 2, 3, 1, 9) == 0
+
+        C = _tcollect(A)
+        @test C isa Array{Rec,4} && all(I -> C[I] === ref[I], CartesianIndices(ref))
+        # a slice stays lazy
+        v = view(A, :, :, 2, 9)
+        @test !(v isa Array) && size(v) == (bs[3], bs[2]) && all(I -> v[I] === ref[I, 2, 9], CartesianIndices(v))
+    end
+
+    # _shared: f once per distinct key, one object for equal keys
+    keys = [(1, 2), (3, 4), (1, 2), (5, 6), (3, 4), (1, 2)]
+    n = Threads.Atomic{Int}(0)
+    vals = _shared(k -> (Threads.atomic_add!(n, 1); collect(k)), keys)
+    @test n[] == 3 && vals == map(collect, keys)
+    @test all(((i, j),) -> (vals[i] === vals[j]) == (keys[i] == keys[j]), Iterators.product(eachindex(keys), eachindex(keys)))
 end
 
 @testitem "_" begin

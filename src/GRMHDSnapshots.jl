@@ -6,8 +6,8 @@ using LinearAlgebra: Diagonal, cross
 using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
-using DataManipulation: filtermap, flatmap
-using OhMyThreads: tforeach, @tasks, chunks
+using DataManipulation: filtermap, flatmap, mapview
+using OhMyThreads: tforeach, tmap, @tasks, chunks
 import StructArrays
 import ForwardDiff
 import Adapt
@@ -332,7 +332,7 @@ end
 _cellmap(fs::NamedTuple, n) = [map(f -> f(k, j, i), fs) for k in 1:n[1], j in 1:n[2], i in 1:n[3]]
 
 """
-    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, fields=(:ρ, :ũ, :B), M_unit=nothing, MBH=nothing)
+    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, fields=(:ρ, :ũ, :B), lazy=false, M_unit=nothing, MBH=nothing)
 
 Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …) as its own AMR blocks, without
 resampling: a [`GRMHDSnapshot`](@ref) on a [`BlockGrid`](@ref), `fluid` indexed `(:φ, :θ, :r, :block)`. `sample`
@@ -362,13 +362,16 @@ are placed at the standard cell centers of their block (see [`BlockGrid`](@ref))
   run.
 - `rmin`, `rmax`: radial range; `nothing` extends to the grid edge.
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
+- `lazy`: `true` leaves the cells in the memory-mapped dump files and converts each one when it is read (same values),
+  so nothing is held in memory per cell: for [`resample`](@ref) of dumps too large to load. Reading the same cell again
+  converts it again.
 - `M_unit`, `MBH`: physical units (both M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.
 """
 function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = nothing, fields = (:ρ, :ũ, :B),
-                   M_unit = nothing, MBH = nothing)
+                   lazy = false, M_unit = nothing, MBH = nothing)
     ks = _fluid_keys(fields)
     Rv = _hamr_rotation(spin_axis)
     par = _hamr_parameters(joinpath(dir, "parameters"))
@@ -389,27 +392,40 @@ function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = 
     coord = map(SVector{3,Int32}, sel.coord)
     grid = BlockGrid(coords, level, coord, nb, startx, ext0, r_extent)
 
-    z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks]
-    fluid = Array{typeof(map(x -> Float32.(x), z))}(undef, bs[3], bs[2], bs[1], length(sel))
-    # each task writes only its own blocks
-    tforeach(eachindex(sel)) do b
-        X = _block_centers(startx, ext0, level[b], coord[b], bs)
-        _hamr_native_block!(view(fluid, :, :, :, b), sel.cells[b], X, coords, Rv, par.a, typeof(z))
-    end
-    GRMHDSnapshot(NamedDimsArray(fluid, (:φ, :θ, :r, :block)), grid, Rv, par.a, par.gam, par.t, M_unit, MBH)
+    records = _hamr_records(collect(sel.cells), level, coord, startx, ext0, bs, coords, Rv, par.a, ks)
+    GRMHDSnapshot(NamedDimsArray(lazy ? records : _tcollect(records), (:φ, :θ, :r, :block)), grid, Rv, par.a, par.gam, par.t, M_unit, MBH)
 end
 
-# A block's stored cells `cells` into `out` (both φ, θ, r), each converted to KS at its own center (native centers `X`
-# per direction (r, θ, φ)) as `E`, then stored in `out`'s precision.
-function _hamr_native_block!(out::AbstractArray{Rec}, cells, X, coords, Rv, a, ::Type{E}) where {Rec, E}
+# The blocks' stored cells `cells[b]` (memory-mapped, φ, θ, r) as one read-only `(φ, θ, r, block)` array of the records of
+# the fields `ks`: reading an element converts that cell to KS at its own centre, in `Float64`, and gives it in the dump
+# precision. Nothing is held per cell; the geometry of the (θ, r) centres and (sin φ, cos φ) are held once per distinct
+# block footprint in (r, θ) and in φ, so blocks refined only in φ, or stacked along it, share them.
+function _hamr_records(cells, level, coord, startx, ext0, bs, coords, Rv, a, ks)
+    z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks]
+    E = typeof(z)
+    Rec = typeof(map(x -> Float32.(x), z))
     R = _rotation(Rv)
-    φs = map(sincos, X[3])
-    for il in axes(out, 3), jl in axes(out, 2)
-        gc = _hamr_center_geometry(E, coords, X[1][il], X[2][jl])
-        for kl in axes(out, 1)
-            @inbounds out[kl, jl, il] = convert(Rec, _hamr_ks(ltoh.(cells[kl, jl, il]), gc, φs[kl], R, a, E))
-        end
+    X(d, l, i) = _cell_center(startx[d], ext0[d], bs[d], l, i)
+    geo = _shared(map((l, c) -> (l[1], l[2], c[1], c[2]), level, coord)) do (l1, l2, c1, c2)
+        [_hamr_center_geometry(E, coords, X(1, l1, c1*bs[1] + i), X(2, l2, c2*bs[2] + j)) for j in 0:bs[2]-1, i in 0:bs[1]-1]
     end
+    φs = _shared(((l, c),) -> map(k -> sincos(X(3, l, c*bs[3] + k)), 0:bs[3]-1), map((l, c) -> (l[3], c[3]), level, coord))
+    # inlined into the caller's loop: a call per cell costs a quarter of the conversion
+    @inline record(I) = @inbounds ((k, j, i, b) = Tuple(I); convert(Rec, _hamr_ks(ltoh.(cells[b][k, j, i]), geo[b][j, i], φs[b][k], R, a, E)))
+    mapview(record, CartesianIndices((bs[3], bs[2], bs[1], length(cells))))
+end
+
+# `f(key)` of every key, computed once per distinct key (threaded) and shared among equal keys.
+function _shared(f, keys)
+    u = unique(keys)
+    vals = Dict(zip(u, tmap(f, u)))
+    map(k -> vals[k], keys)
+end
+
+# A `(φ, θ, r, block)` array as an `Array`, block by block on all threads.
+function _tcollect(A)
+    out = similar(A)
+    tforeach(b -> copyto!(view(out, :, :, :, b), view(A, :, :, :, b)), axes(A, 4))
     out
 end
 
