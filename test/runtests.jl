@@ -17,8 +17,8 @@ using TestItemRunner
     @test size(snap.fluid) == (24, 32, 48)
     @test parent(snap.fluid) isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 3}
     @test r_min(snap) < r_max(snap)
-    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
-    @test all(>(0), diff(snap.r_prof))
+    @test (r_min(snap), r_max(snap)) == (snap.grid.r_prof[1], snap.grid.r_prof[end])
+    @test all(>(0), diff(snap.grid.r_prof))
 
     (; ρ, ũ, B) = rec5 = @inferred sample(snap, 5.0, 0.0, 0.0)
     @test rec5 isa @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
@@ -27,7 +27,7 @@ using TestItemRunner
     @test B isa SVector{3,Float64} && all(isfinite, B)
 
     i, j, k = 20, 16, 12
-    rn = snap.r_prof[i]; θn = snap.th_grid[i, j]; φn = snap.φ0 + (k - 1) * snap.dφ
+    rn = snap.grid.r_prof[i]; θn = snap.grid.th_grid[i, j]; φn = snap.grid.φ0 + (k - 1) * snap.grid.dφ
     xn = rn * sin(θn) * cos(φn); yn = rn * sin(θn) * sin(φn); zn = rn * cos(θn)
     @test sample(snap, xn, yn, zn).ρ ≈ snap.fluid[φ=k, θ=j, r=i].ρ
     @test sample(snap, xn, yn, zn).ũ ≈ snap.fluid[φ=k, θ=j, r=i].ũ rtol = 1e-11
@@ -85,7 +85,7 @@ end
     @test dimnames(snap2.fluid) == dimnames(snap.fluid) == (:φ, :θ, :r)
     @test snap2.fluid == snap.fluid
     @test eltype(snap2.fluid) == eltype(snap.fluid)
-    @test snap2.r_extent === snap.r_extent
+    @test snap2.grid.r_extent === snap.grid.r_extent
     @test snap2.R === snap.R === Val(one(SMatrix{3,3,Int}))
 end
 
@@ -98,8 +98,8 @@ end
         s = load_koral(h5path)
         @test s.M_unit === nothing && s.MBH === nothing        # a non-radiative run: scale-free
         @test r_min(s) < r_max(s)
-        @test (r_min(s), r_max(s)) == (s.r_prof[1], s.r_prof[end])
-        @test all(>(0), diff(s.r_prof))
+        @test (r_min(s), r_max(s)) == (s.grid.r_prof[1], s.grid.r_prof[end])
+        @test all(>(0), diff(s.grid.r_prof))
         @test eltype(s.fluid) == @NamedTuple{ρ::Float64, ũ::SVector{3,Float64}, B::SVector{3,Float64}}
         (; ρ, ũ, B) = @inferred sample(s, 5.0, 0.0, 0.0)
         @test isfinite(ρ) && all(isfinite, ũ) && all(isfinite, B)
@@ -108,14 +108,14 @@ end
         h5open(h5path, "r") do h5
             r = read(h5["grid_out/r"]); th = read(h5["grid_out/th"]); ph = read(h5["grid_out/ph"])
             n3, n2, n1 = size(r)
-            @test s.r_prof == Float64[r[1, 1, i] for i in 1:n1]
-            @test s.th_grid == Float64[th[1, j, i] for i in 1:n1, j in 1:n2]
-            @test s.φ0 == Float64(ph[1, 1, 1]) + π
-            @test s.dφ == (Float64(ph[n3, 1, 1]) - Float64(ph[1, 1, 1]))/(n3 - 1)
+            @test s.grid.r_prof == Float64[r[1, 1, i] for i in 1:n1]
+            @test s.grid.th_grid == Float64[th[1, j, i] for i in 1:n1, j in 1:n2]
+            @test s.grid.φ0 == Float64(ph[1, 1, 1]) + π
+            @test s.grid.dφ == (Float64(ph[n3, 1, 1]) - Float64(ph[1, 1, 1]))/(n3 - 1)
         end
         sρ = load_koral(h5path; fields = (:ρ,))
         @test sρ.fluid == map(c -> c[(:ρ,)], s.fluid)
-        @test (sρ.r_prof, sρ.th_grid, sρ.φ0, sρ.dφ) == (s.r_prof, s.th_grid, s.φ0, s.dφ)
+        @test (sρ.grid.r_prof, sρ.grid.th_grid, sρ.grid.φ0, sρ.grid.dφ) == (s.grid.r_prof, s.grid.th_grid, s.grid.φ0, s.grid.dφ)
 
         s_store = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
         sl = (1:6:144, 1:6:192, 1:6:288)
@@ -200,8 +200,8 @@ end
     s = load_koral(h5paths[0])
     @test size(s.fluid) == (n3, n2, n1)
     @test s.spin == 0.9 && s.gam == 13/9 && s.t == 2000.0
-    @test s.r_prof == rs && s.th_grid == ths
-    @test s.φ0 ≈ phs[1] + π && s.dφ ≈ 2π/n3
+    @test s.grid.r_prof == rs && s.grid.th_grid == ths
+    @test s.grid.φ0 ≈ phs[1] + π && s.grid.dφ ≈ 2π/n3
     k, j, i = 3, 2, 4
     @test s.fluid[φ=k, θ=j, r=i].ρ == quants.rho[k, j, i]
     @test s.fluid[φ=k, θ=j, r=i].ũ == SVector(quants.U1[k, j, i], quants.U2[k, j, i], quants.U3[k, j, i])
@@ -214,12 +214,12 @@ end
         @test fieldnames(eltype(sp.fluid)) == K
         @test parent(sp.fluid) isa Array && dimnames(sp.fluid) == (:φ, :θ, :r)
         @test sp.fluid == map(c -> c[K], s.fluid)
-        @test (sp.r_prof, sp.th_grid, sp.φ0, sp.dφ) == (s.r_prof, s.th_grid, s.φ0, s.dφ)
+        @test (sp.grid.r_prof, sp.grid.th_grid, sp.grid.φ0, sp.grid.dφ) == (s.grid.r_prof, s.grid.th_grid, s.grid.φ0, s.grid.dφ)
     end
     @test_throws ArgumentError load_koral(h5paths[0]; fields = ())
     @test_throws ArgumentError load_koral(h5paths[0]; fields = (:rho,))
     sρ = load_snapshot(h5paths[0]; fields = (:ρ,))
-    @test sρ.fluid == map(c -> c[(:ρ,)], s.fluid) && sρ.th_grid == ths
+    @test sρ.fluid == map(c -> c[(:ρ,)], s.fluid) && sρ.grid.th_grid == ths
 end
 
 @testitem "plasma physics" begin
@@ -235,7 +235,7 @@ end
     # Physical invariants of the reconstructed plasma state at sampled cells:
     # u·u = -1 (timelike, normalized) and b·u = 0 (comoving field ⊥ 4-velocity), bsq ≥ 0.
     for (i, j, k) in ((20, 16, 12), (10, 8, 3), (40, 24, 20), (5, 30, 1))
-        r = snap.r_prof[i]; θ = snap.th_grid[i, j]
+        r = snap.grid.r_prof[i]; θ = snap.grid.th_grid[i, j]
         (; ũ, B) = snap.fluid[φ=k, θ=j, r=i]
         g = ks_gcov(r, θ, a)
         (; u, b, bsq) = plasma_state(ũ, B, r, θ, a)
@@ -284,14 +284,14 @@ end
     # comoving_bsq grid value equals the kernel on that cell's primitives.
     i, j, k = 20, 16, 12
     @test bsqg[φ=k, θ=j, r=i] ≈ plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B,
-                                             snap.r_prof[i], snap.th_grid[i, j], a).bsq
+                                             snap.grid.r_prof[i], snap.grid.th_grid[i, j], a).bsq
 
     # map_plasma hoists the (r,θ)-only metric across φ and threads over r: over the whole grid it must
     # match a naive per-cell reconstruction (independent reference) up to FMA reassociation, and its
     # result must be bit-identical regardless of thread count.
     nφ, nθ, nr = size(snap.fluid)
     bsq_ref = [plasma_state(snap.fluid[φ=k, θ=j, r=i].ũ, snap.fluid[φ=k, θ=j, r=i].B,
-                            snap.r_prof[i], snap.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
+                            snap.grid.r_prof[i], snap.grid.th_grid[i, j], a).bsq for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test bsqg ≈ bsq_ref rtol = 1e-13
     @test map_plasma((ps, _, _) -> ps.bsq, snap; threaded = true) ==
           map_plasma((ps, _, _) -> ps.bsq, snap; threaded = false)
@@ -313,20 +313,20 @@ end
     @test lapse(snap_b) == lapse(snap)
 
     # lapse(snap) equals the scalar lapse at each cell's (r,θ).
-    @test lap ≈ [lapse(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
+    @test lap ≈ [lapse(snap.grid.r_prof[i], snap.grid.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
 
     # grav_redshift(snap) equals the scalar grav_redshift at each cell's (r,θ).
     zg = grav_redshift(snap)
     @test size(zg) == size(snap.fluid) && all(x -> 0 ≤ x ≤ 1, zg)
-    @test zg ≈ [grav_redshift(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
+    @test zg ≈ [grav_redshift(snap.grid.r_prof[i], snap.grid.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
 
     # volume_ratio(snap) equals the scalar at each cell's (r,θ), and is ≥ 1 everywhere.
     vr = volume_ratio(snap)
     @test size(vr) == size(snap.fluid) && all(≥(1), vr)
-    @test vr ≈ [volume_ratio(snap.r_prof[i], snap.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
+    @test vr ≈ [volume_ratio(snap.grid.r_prof[i], snap.grid.th_grid[i, j], a) for k in 1:nφ, j in 1:nθ, i in 1:nr] rtol = 1e-12
 
     # the vector-field maps and map_plasma's record equal the per-cell scalar functions at each cell's (r, θ)
-    percell(f) = [f(snap.fluid[φ=k, θ=j, r=i], snap.r_prof[i], snap.th_grid[i, j]) for k in 1:nφ, j in 1:nθ, i in 1:nr]
+    percell(f) = [f(snap.fluid[φ=k, θ=j, r=i], snap.grid.r_prof[i], snap.grid.th_grid[i, j]) for k in 1:nφ, j in 1:nθ, i in 1:nr]
     @test flow_speed(snap) ≈ percell((c, r, θ) -> flow_speed(c.ũ, r, θ, a)) rtol = 1e-13
     @test proper_velocity(snap) ≈ percell((c, r, θ) -> proper_velocity(c.ũ, r, θ, a)) rtol = 1e-13
     @test fluid_velocity(snap) ≈ percell((c, r, θ) -> fluid_velocity(c.ũ, r, θ, a)) rtol = 1e-13
@@ -348,7 +348,8 @@ end
     @test bunit(snap) ≈ 2.99792458e10*sqrt(4π*rhounit(snap))
     # Float32 scalars (as after a whole-snapshot Float32 conversion) still give Float64 units, also where r_g³ in cm³
     # or a large M_unit in grams would overflow Float32.
-    snap32 = setproperties(snap, map(Float32, (; snap.φ0, snap.dφ, snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH)))
+    snap32 = setproperties(snap, (; grid = setproperties(snap.grid, map(Float32, (; snap.grid.φ0, snap.grid.dφ))),
+                                    map(Float32, (; snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH))...))
     @test snap32.MBH isa Float32 && snap32.M_unit isa Float32
     @test unitsof(snap32) isa Vector{Float64}
     @test unitsof(snap32) ≈ unitsof(snap) rtol = 1e-6
@@ -376,7 +377,7 @@ end
             V[3]*r*sin(θ)*SVector(-sin(φ), cos(φ), 0)
     end
     # the interpolated grid record at grid point q, unconverted
-    raw(snap, q) = _apply_stencil(_sample_stencil(snap, size(snap.fluid, :φ), q...), snap.fluid)
+    raw(snap, q) = _apply_stencil(_sample_stencil(snap.grid, size(snap.fluid, :φ), q...), snap.fluid)
 
     koral = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
     # each snapshot with in-grid radii; the H-AMR one with spin along grid z, so R is the identity
@@ -428,11 +429,11 @@ end
         # nodes at φ < π: past it the lookup's atan wraps by 2π, while the grid's period nφ·dφ is 2π only to the precision
         # of the stored φ. k = 1 is a node of the stencil across the wrap (k = nφ, 1).
         nφ, nθ, nr = size(snap.fluid)
-        km = findlast(k -> snap.φ0 + (k - 1)*snap.dφ < π, 1:nφ)
+        km = findlast(k -> snap.grid.φ0 + (k - 1)*snap.grid.dφ < π, 1:nφ)
         ir = (2, nr - 1, nr ÷ 2)
         cells = [(1, 1, ir[1]), (km, nθ, ir[2]), (km ÷ 2, 2, ir[3]), (1, nθ ÷ 2, ir[1]), (km, 1, ir[3]), (3, nθ - 1, ir[2])]
         pts = map(cells) do (k, j, i)
-            r = snap.r_prof[i]; θ = snap.th_grid[i, j]; φ = snap.φ0 + (k - 1)*snap.dφ
+            r = snap.grid.r_prof[i]; θ = snap.grid.th_grid[i, j]; φ = snap.grid.φ0 + (k - 1)*snap.grid.dφ
             p = M*(r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)))
             (; r, θ′ = acos(p[3]/norm(p)), s = sample(snapR, p...))
         end
@@ -652,7 +653,7 @@ end
     @test_throws ArgumentError load_iharm(path; fields = (:velrel,))
     @test snap.spin == par.a && snap.gam ≈ 1.444444 && snap.t == 123.0
     @test snap.M_unit === nothing && snap.MBH === nothing         # scale-free by default
-    @test snap.φ0 ≈ sx3 + 0.5dx3 && snap.dφ ≈ dx3                 # φ = X3, no +π offset
+    @test snap.grid.φ0 ≈ sx3 + 0.5dx3 && snap.grid.dφ ≈ dx3                 # φ = X3, no +π offset
 
     # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
     @test_throws "lunit needs MBH (M☉)" lunit(snap)
@@ -672,13 +673,13 @@ end
     @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
     @test (@set snapbm.M_unit = nothing).M_unit === nothing
 
-    @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
+    @test (r_min(snap), r_max(snap)) == (snap.grid.r_prof[1], snap.grid.r_prof[end])
     c = FMKS(startx1 = sx1, hslope = par.hslope, mks_smooth = par.mks_smooth, poly_xt = par.poly_xt, poly_alpha = par.poly_alpha)
     for i in 1:n1, j in 1:n2, k in 1:n3
         X1 = sx1 + (i-0.5)*dx1; X2 = sx2 + (j-0.5)*dx2
         r, th = bl_coord(c, X1, X2); J = jacobian_spatial(c, X1, X2)
-        @test snap.r_prof[i] ≈ r
-        @test snap.th_grid[i, j] ≈ th
+        @test snap.grid.r_prof[i] ≈ r
+        @test snap.grid.th_grid[i, j] ≈ th
         @test snap.fluid[φ=k, θ=j, r=i].ρ ≈ prims[1, k, j, i]
         @test snap.fluid[φ=k, θ=j, r=i].ũ ≈ J*SVector(prims[3, k, j, i], prims[4, k, j, i], prims[5, k, j, i])
         @test snap.fluid[φ=k, θ=j, r=i].B ≈ J*SVector(prims[6, k, j, i], prims[7, k, j, i], prims[8, k, j, i])
@@ -695,7 +696,7 @@ end
     if isfile(path)
         snap = load_iharm(path)
         @test size(snap.fluid) == (128, 128, 288)
-        @test r_min(snap) < r_max(snap) && all(>(0), diff(snap.r_prof))
+        @test r_min(snap) < r_max(snap) && all(>(0), diff(snap.grid.r_prof))
         @test snap.spin == 0.0
 
         # lazy units: scale-free by default ⇒ throw; supplied ⇒ positive scalars.
@@ -713,7 +714,7 @@ end
                 (199, 109, 119, 142.719055604, 2.37849777729, 0.0111680263653, 9.7388717037e-6, 0.000872031582404, 1.00266551412)]
         for (i, j, k, rg, thg, rhog, bsqg, sigg, Gamg) in gold
             I, J, K = i+1, j+1, k+1
-            r = snap.r_prof[I]; th = snap.th_grid[I, J]; a = snap.spin
+            r = snap.grid.r_prof[I]; th = snap.grid.th_grid[I, J]; a = snap.spin
             rho = snap.fluid[φ=K, θ=J, r=I].ρ
             ps = plasma_state(snap.fluid[φ=K, θ=J, r=I].ũ, snap.fluid[φ=K, θ=J, r=I].B, r, th, a)
             Γ = lapse(r, th, a) * ps.u[1]
@@ -803,9 +804,9 @@ end
         snap = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235)      # the innermost 5 radial cells, all fields
         @test size(snap.fluid) == (1024, 1056, 5)
         @test snap.t == 5993.937771363162 && snap.spin == 0.9375 && snap.gam == 4/3
-        @test snap.dφ ≈ 2π/1024 && snap.φ0 ≈ π/1024
-        @test snap.r_prof[1] ≈ 1.2154603380902425 rtol = 1e-14         # gdump-stored r, θ of cell (i=0, j=22)
-        @test snap.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
+        @test snap.grid.dφ ≈ 2π/1024 && snap.grid.φ0 ≈ π/1024
+        @test snap.grid.r_prof[1] ≈ 1.2154603380902425 rtol = 1e-14         # gdump-stored r, θ of cell (i=0, j=22)
+        @test snap.grid.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
         @test all(c -> c.ρ > 0, snap.fluid)
         @test all(c -> all(isfinite, c.ũ) && all(isfinite, c.B), snap.fluid)
         @test load_snapshot(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.221).fluid == snap.fluid[r=1:2]
@@ -831,7 +832,7 @@ end
             p = raw(0, 86, ii, jj, kk)
             i, j = ii, 8*22 + jj
             @test snap.fluid[φ=kk+1, θ=j+1, r=i+1].ρ == p[1]
-            u = fluid_ucon(snap.fluid[φ=kk+1, θ=j+1, r=i+1].ũ, snap.r_prof[i+1], snap.th_grid[i+1, j+1], snap.spin)
+            u = fluid_ucon(snap.fluid[φ=kk+1, θ=j+1, r=i+1].ũ, snap.grid.r_prof[i+1], snap.grid.th_grid[i+1, j+1], snap.spin)
             @test u[1] ≈ p[3] rtol = 1e-5
             @test u[SVector(2, 3, 4)] ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(4, 5, 6)] rtol = 1e-5
             @test snap.fluid[φ=kk+1, θ=j+1, r=i+1].B ≈ jacobian_spatial(c, X1(i), X2(j))*p[SVector(7, 8, 9)] rtol = 1e-5
@@ -910,11 +911,11 @@ end
         # level-1 spacings: half the level-0 ones log(Rout/Rin)/420, 2·0.98958…/96, 2π/96
         h1 = log(1e6/1.2131867454091887)/840; h2 = 2*0.9895833333333334/192
         X1(i) = 0.19325057145871735 + (i + 1/2)*h1; X2(j) = -0.9895833333333334 + (j + 1/2)*h2; X3(k) = (k + 1/2)*2π/192
-        @test snap.r_prof ≈ [4.060943340300723, 4.127336454415088, 4.194815041837602] rtol = 1e-14   # level-1 cells 74–76
-        @test (r_min(snap), r_max(snap)) == (snap.r_prof[1], snap.r_prof[end])
-        @test snap.th_grid ≈ [π/2*(1 + X2(j)) for i in 74:76, j in 0:191] rtol = 1e-14
-        @test snap.th_grid[1, 1] ≈ 0.024458471451287742 rtol = 1e-14
-        @test snap.φ0 ≈ π/192 && snap.dφ ≈ 2π/192
+        @test snap.grid.r_prof ≈ [4.060943340300723, 4.127336454415088, 4.194815041837602] rtol = 1e-14   # level-1 cells 74–76
+        @test (r_min(snap), r_max(snap)) == (snap.grid.r_prof[1], snap.grid.r_prof[end])
+        @test snap.grid.th_grid ≈ [π/2*(1 + X2(j)) for i in 74:76, j in 0:191] rtol = 1e-14
+        @test snap.grid.th_grid[1, 1] ≈ 0.024458471451287742 rtol = 1e-14
+        @test snap.grid.φ0 ≈ π/192 && snap.grid.dφ ≈ 2π/192
 
         # Raw cells by independent byte arithmetic, slot 0 of a new_dump file (block → file from the `parameters`
         # triples, levels/coords from the grid records): 9 float32 per cell, φ fastest, then θ, then r.
@@ -967,7 +968,7 @@ end
         v = fluid_velocity(sL)
         L = sum(CartesianIndices(parent(sL.fluid))) do I
             k, j, i = Tuple(I)
-            r = sL.r_prof[i]; θ = sL.th_grid[i, j]; φ = sL.φ0 + (k - 1)*sL.dφ
+            r = sL.grid.r_prof[i]; θ = sL.grid.th_grid[i, j]; φ = sL.grid.φ0 + (k - 1)*sL.grid.dφ
             x = R*(r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)))
             θ′ = acos(x[3]/r); φ′ = atan(x[2], x[1])
             vr, vθ, vφ = v[φ=k, θ=j, r=i]
@@ -979,8 +980,8 @@ end
 
         # caps: an output cell is the mean of the stored cells it covers; the other directions stay at level 1
         sφ = ld(rmin = 4, rmax = 4.2, maxlevel = (φ = 0,))
-        @test size(sφ.fluid) == (96, 192, 3) && sφ.φ0 ≈ π/96 && sφ.dφ ≈ 2π/96
-        @test sφ.r_prof == snap.r_prof && sφ.th_grid == snap.th_grid
+        @test size(sφ.fluid) == (96, 192, 3) && sφ.grid.φ0 ≈ π/96 && sφ.grid.dφ ≈ 2π/96
+        @test sφ.grid.r_prof == snap.grid.r_prof && sφ.grid.th_grid == snap.grid.th_grid
         for ii in 4:6, jj in (0, 15), m in (0, 11)
             p, q = raw(6, ii, jj, 2m), raw(6, ii, jj, 2m + 1); i, j = 70 + ii, 16 + jj
             @test sφ.fluid[φ=12+m+1, θ=j+1, r=i-73].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
@@ -998,9 +999,9 @@ end
 
         # level-0 radial cell 37 = level-1 cells 74, 75 = block 25969's ii = 4, 5; each stored cell converted at its own r
         sr = ld(rmin = 4, rmax = 4.2, maxlevel = (r = 0, θ = nothing))
-        @test size(sr.fluid) == (192, 192, 1) && sr.dφ == snap.dφ
-        @test sr.r_prof ≈ [4.09400531115158] rtol = 1e-14
-        @test sr.th_grid ≈ snap.th_grid[1:1, :] rtol = 1e-14
+        @test size(sr.fluid) == (192, 192, 1) && sr.grid.dφ == snap.grid.dφ
+        @test sr.grid.r_prof ≈ [4.09400531115158] rtol = 1e-14
+        @test sr.grid.th_grid ≈ snap.grid.th_grid[1:1, :] rtol = 1e-14
         for jj in (0, 15), kk in (0, 23)
             p, q = raw(6, 4, jj, kk), raw(6, 5, jj, kk); j, k = 16 + jj, 24 + kk
             @test sr.fluid[φ=k+1, θ=j+1, r=1].ρ ≈ (p[1] + q[1])/2 rtol = 1e-6
@@ -1011,8 +1012,8 @@ end
         # level-0 θ cell m = level-1 cells 2m, 2m+1 = block 25969's jj = 2m-16, 2m-15
         sθ = ld(rmin = 4, rmax = 4.2, maxlevel = (θ = 0,), fields = (:ρ,))
         @test size(sθ.fluid) == (192, 96, 3) && eltype(sθ.fluid) == @NamedTuple{ρ::Float32}
-        @test sθ.r_prof == snap.r_prof && sθ.dφ == snap.dφ
-        @test sθ.th_grid ≈ [π/2*(1 - 0.9895833333333334 + (j + 1/2)*2h2) for i in 1:3, j in 0:95] rtol = 1e-14
+        @test sθ.grid.r_prof == snap.grid.r_prof && sθ.grid.dφ == snap.grid.dφ
+        @test sθ.grid.th_grid ≈ [π/2*(1 - 0.9895833333333334 + (j + 1/2)*2h2) for i in 1:3, j in 0:95] rtol = 1e-14
         for ii in 4:6, m in (8, 15), kk in (0, 23)
             @test sθ.fluid[φ=24+kk+1, θ=m+1, r=ii-3].ρ ≈ (raw(6, ii, 2m-16, kk)[1] + raw(6, ii, 2m-15, kk)[1])/2 rtol = 1e-6
         end

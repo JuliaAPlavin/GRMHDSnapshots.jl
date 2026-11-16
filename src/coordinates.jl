@@ -1,7 +1,7 @@
 # Funky Modified Kerr-Schild (FMKS) native coordinates X = (X1, X2, X3) → Kerr-Schild (r, θ, φ), as
 # used by iharm3d/KHARMA dumps. Follows ipole's coordinates.c (`bl_coord` and `set_dxdX`, FMKS branch):
 # r = exp(X1), φ = X3 (uniform), θ = θ(X1, X2). The (r, θ) map depends only on (X1, X2) — the grid is
-# axisymmetric — so a snapshot's `r_prof`/`th_grid` and the per-cell vector Jacobian are all φ-independent.
+# axisymmetric — so a snapshot grid's `r_prof`/`th_grid` and the per-cell vector Jacobian are all φ-independent.
 
 """
     FMKS(; startx1, hslope, mks_smooth, poly_xt, poly_alpha)

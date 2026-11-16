@@ -212,22 +212,38 @@ bunit(snap::GRMHDSnapshot) = (_require_units(snap, :bunit, :M_unit, :MBH); ustri
 # f(cell, fr) at every cell, as a `(:φ,:θ,:r)` array: the cell's fluid record (grid components) and its spin-frame geometry
 # fr = (; r, n, eθ, eφs) for `_tospin` and `_ks_gcov`. `f` converts only the fields it reads, so unread ones cost nothing
 # and a partially loaded snapshot works. `foreach_r` runs over the radial slabs (`foreach` or `tforeach`).
-function _map_cells(f, snap::GRMHDSnapshot, foreach_r)
-    (; fluid, r_prof, th_grid, φ0, dφ) = snap
-    A = parent(fluid)
-    R = _rotation(snap.R); z = R[:, 3]
-    # per φ column (center as in `_sample_stencil`): the spin-frame directions of the grid's x̂ cosφ + ŷ sinφ and φ̂
-    cols = map(axes(A, 1)) do k
-        sφ, cφ = sincos(φ0 + (k - 1)*dφ)
-        (u = R*SVector(cφ, sφ, zero(cφ)), v = R*SVector(-sφ, cφ, zero(cφ)))
-    end
-    # inlined into the loop: a call per cell costs more than the cell's own work
-    @inline cell(k, j, i, sθ, cθ) = @inbounds let (; u, v) = cols[k]
-        @inline f(A[k, j, i], (r = r_prof[i], n = sθ*u + cθ*z, eθ = cθ*u - sθ*z, eφs = sθ*v))
-    end
-    out = Array{typeof(cell(1, 1, 1, sincos(th_grid[1, 1])...))}(undef, size(A))
-    foreach_r(i -> _fill_slab!(out, cell, i, view(th_grid, i, :)), axes(A, 3))
+_map_cells(f::F, snap::GRMHDSnapshot, foreach_r::FR) where {F, FR} = _map_cells(f, snap.grid, snap, foreach_r)
+
+function _map_cells(f::F, g::TensorGrid, snap, foreach_r::FR) where {F, FR}
+    A = parent(snap.fluid)
+    R = _rotation(snap.R)
+    out = Array{_patch_eltype(f, A, R, g.r_prof, g.th_grid, g.φ0)}(undef, size(A))
+    _map_patch!(out, f, A, R, g.r_prof, g.th_grid, g.φ0, g.dφ, foreach_r)
     NamedDimsArray(out, (:φ, :θ, :r))
+end
+
+# The spin-frame directions of the grid's x̂ cosφ + ŷ sinφ and φ̂ at azimuth φ.
+@inline function _φcol(R, φ)
+    sφ, cφ = sincos(φ)
+    (u = R*SVector(cφ, sφ, zero(cφ)), v = R*SVector(-sφ, cφ, zero(cφ)))
+end
+
+# f at a cell of record `a`, radius r, colatitude (sin, cos) = (sθ, cθ), φ column `col` (`_φcol`), spin axis z = R[:, 3].
+@inline _patch_cell(f, a, r, sθ, cθ, (; u, v), z) = @inline f(a, (r = r, n = sθ*u + cθ*z, eθ = cθ*u - sθ*z, eφs = sθ*v))
+
+# Element type of `_map_patch!`'s output: f at the patch's first cell.
+_patch_eltype(f::F, A, R, rs, ths, φ0) where {F} = typeof(_patch_cell(f, first(A), first(rs), sincos(first(ths))..., _φcol(R, φ0), R[:, 3]))
+
+# One tensor patch: f(cell, fr) of every cell of the `(φ, θ, r)` records `A` into `out`, cell (k, j, i) centred at
+# radius rs[i], colatitude ths[i, j], azimuth φ0 + (k−1)·dφ. `foreach_r` runs over the radial slabs.
+function _map_patch!(out, f::F, A, R, rs, ths, φ0, dφ, foreach_r::FR) where {F, FR}
+    z = R[:, 3]
+    # per φ column (center as in `_sample_stencil`)
+    cols = map(k -> _φcol(R, φ0 + (k - 1)*dφ), axes(A, 1))
+    # inlined into the loop: a call per cell costs more than the cell's own work
+    @inline cell(k, j, i, sθ, cθ) = @inbounds _patch_cell(f, A[k, j, i], rs[i], sθ, cθ, cols[k], z)
+    foreach_r(i -> _fill_slab!(out, cell, i, view(ths, i, :)), axes(A, 3))
+    out
 end
 
 # Radial slab `i` of `out`: sincos of each grid θ once, then every cell.

@@ -15,30 +15,41 @@ import Mmap
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
-export GRMHDSnapshot, load_snapshot, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
+export GRMHDSnapshot, TensorGrid, load_snapshot, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
     plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
 include("coordinates.jl")
 
+"""
+    TensorGrid(r_prof, th_grid, φ0, dφ)
+
+Tensor-product spherical grid: cell `(φ=k, θ=j, r=i)` is centred at `r_prof[i]`, `th_grid[i, j]`, `φ0 + (k - 1)·dφ`.
+"""
+struct TensorGrid{Rp, Re, Tg, T}
+    r_prof::Rp      # radial cell centres
+    r_extent::Re    # r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU
+    th_grid::Tg     # θ cell centres, (r, θ)
+    φ0::T
+    dφ::T
+end
+
+TensorGrid(r_prof, th_grid, φ0, dφ) = TensorGrid(r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ)
+
 # `M_unit` (code mass unit) and `MBH` (black-hole mass), both in M☉ — fits Float32, unlike grams — each carry their own
 # type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
 # H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
-# `r_extent` = r_prof[1]..r_prof[end], stored: readable without indexing r_prof, which may live on a GPU.
 # `fluid` is a `(:φ,:θ,:r)` array of per-cell records with the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B`
 # (lab field B^i), vectors in Kerr-Schild components of the grid's spherical coordinates; a partial load holds only the
 # requested keys, in that order. One interleaved record per cell: an interpolation reads each stencil corner from one place.
+# `grid` (a `TensorGrid`) places the cells of `fluid`.
 # `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
 # point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
 # `sample` and the grid maps return vectors in spin-frame Kerr-Schild components.
-struct GRMHDSnapshot{F, Rp, Re, Tg, T, Rt, Um, Ub}
+struct GRMHDSnapshot{F, G, T, Rt, Um, Ub}
     fluid::F
-    r_prof::Rp
-    r_extent::Re
-    th_grid::Tg
-    φ0::T
-    dφ::T
+    grid::G
     R::Rt
     spin::T
     gam::T
@@ -137,7 +148,7 @@ function load_koral_h5(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = n
         radiative = haskey(h5, "header/has_radiation") && read(h5["header/has_radiation"]) != 0
         u = _koral_units(radiative, () -> (M_unit = rdscalar("header/units/M_unit"), M_bh = rdscalar("header/units/M_bh"));
                          M_unit, MBH)
-        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, φ0, dφ, Val(one(SMatrix{3,3,Int})),
+        GRMHDSnapshot(fluid, TensorGrid(r_prof, th_grid, φ0, dφ), Val(one(SMatrix{3,3,Int})),
             rdscalar("header/bhspin"), rdscalar("header/gam"), rdscalar("t"), u.M_unit, u.MBH)
     end
 end
@@ -169,17 +180,17 @@ Load shared grid arrays from a Zarr run store.
 - `store`: Open Zarr run store containing `r`, `th`, and `ph`.
 
 # Returns
-- Named tuple with `r_prof`, `th_grid`, `φ0`, and `dφ`.
+- [`TensorGrid`](@ref).
 """
 function load_grid(store::ZGroup)
     rd(name) = store[name][:, :, :]
     r = rd("r"); th = rd("th"); ph = rd("ph")
     n1 = size(r, 3); n2 = size(r, 2); n3 = size(r, 1)
     φ0_file = Float64(ph[1, 1, 1])
-    (; r_prof  = Float64[r[1, 1, i] for i in 1:n1],
-       th_grid = Float64[th[1, j, i] for i in 1:n1, j in 1:n2],
-       φ0 = φ0_file + π,
-       dφ = (Float64(ph[n3, 1, 1]) - φ0_file)/(n3 - 1))
+    TensorGrid(Float64[r[1, 1, i] for i in 1:n1],
+               Float64[th[1, j, i] for i in 1:n1, j in 1:n2],
+               φ0_file + π,
+               (Float64(ph[n3, 1, 1]) - φ0_file)/(n3 - 1))
 end
 
 """
@@ -213,8 +224,7 @@ function load_koral(store::ZGroup, snapname::AbstractString;
     hdr = store.attrs
     u = _koral_units(get(hdr, "has_radiation", 0) != 0, () -> (M_unit = sc(hdr["units"]["M_unit"]), M_bh = sc(hdr["units"]["M_bh"]));
                      M_unit, MBH)
-    GRMHDSnapshot(fluid, grid.r_prof, first(grid.r_prof)..last(grid.r_prof), grid.th_grid, grid.φ0, grid.dφ,
-        Val(one(SMatrix{3,3,Int})), sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]), u.M_unit, u.MBH)
+    GRMHDSnapshot(fluid, grid, Val(one(SMatrix{3,3,Int})), sc(hdr["bhspin"]), sc(hdr["gam"]), sc(snap.attrs["t"]), u.M_unit, u.MBH)
 end
 
 """
@@ -266,8 +276,7 @@ function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = noth
 
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
         # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-        GRMHDSnapshot(fluid, r_prof, first(r_prof)..last(r_prof), th_grid, sc(sx3 + 0.5*dx3), sc(dx3),
-            Val(one(SMatrix{3,3,Int})), sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
+        GRMHDSnapshot(fluid, TensorGrid(r_prof, th_grid, sc(sx3 + 0.5*dx3), sc(dx3)), Val(one(SMatrix{3,3,Int})), sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
     end
 end
 
@@ -361,8 +370,8 @@ function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = 
     end
 
     # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-    GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), r_prof, first(r_prof)..last(r_prof), th_grid,
-        X(3, 0), dx[3]/2^tl[3], Rv, par.a, par.gam, par.t, M_unit, MBH)
+    GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), TensorGrid(r_prof, th_grid, X(3, 0), dx[3]/2^tl[3]),
+        Rv, par.a, par.gam, par.t, M_unit, MBH)
 end
 
 const _HAMR_SPIN_AXES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1))
@@ -603,7 +612,7 @@ Minimum radial grid coordinate.
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_min(s::GRMHDSnapshot) = leftendpoint(s.r_extent)
+r_min(s::GRMHDSnapshot) = leftendpoint(r_extent(s.grid))
 
 """
     r_max(snapshot)
@@ -613,7 +622,12 @@ Maximum radial grid coordinate.
 # Arguments
 - `snapshot`: Loaded `GRMHDSnapshot`.
 """
-r_max(s::GRMHDSnapshot) = rightendpoint(s.r_extent)
+r_max(s::GRMHDSnapshot) = rightendpoint(r_extent(s.grid))
+
+# The grid interface: `r_extent(grid)`, the radial interval with data; `_grid_sample(grid, fluid, q)`, the fluid record
+# at the grid-frame Cartesian point q in grid components, or `nothing` outside the grid; `_grid_zero(grid, fluid)`, the
+# out-of-grid record, of the type `_grid_sample` returns inside; `_map_cells(f, grid, snap, foreach_r)`.
+r_extent(g::TensorGrid) = g.r_extent
 
 # GPU-safe searchsortedlast.
 @inline function bsearchlast(a, x)
@@ -637,24 +651,24 @@ end
 
 # Trilinear stencil at Cartesian (x,y,z): bracket indices + weights, field-independent.
 # `n3` = φ count (same for every field). Returns `nothing` outside the radial grid.
-@inline function _sample_stencil(s::GRMHDSnapshot, n3, x, y, z)
+@inline function _sample_stencil(g::TensorGrid, n3, x, y, z)
     r = sqrt(x^2 + y^2 + z^2)
-    (r < r_min(s) || r > r_max(s)) && return nothing
+    (r < leftendpoint(r_extent(g)) || r > rightendpoint(r_extent(g))) && return nothing
     θ = acos(clamp(z/r, -one(r), one(r)))
     φ = atan(y, x)
-    n2 = size(s.th_grid, 2)
+    n2 = size(g.th_grid, 2)
 
-    i = clamp(bsearchlast(s.r_prof, r), 1, length(s.r_prof) - 1)
-    ti = (r - s.r_prof[i])/(s.r_prof[i+1] - s.r_prof[i])
+    i = clamp(bsearchlast(g.r_prof, r), 1, length(g.r_prof) - 1)
+    ti = (r - g.r_prof[i])/(g.r_prof[i+1] - g.r_prof[i])
     # Keep NamedDims indices homogeneous for Metal.
-    fk = (φ - s.φ0)/s.dφ
+    fk = (φ - g.φ0)/g.dφ
     k0 = unsafe_trunc(Int, floor(fk)); tk = fk - k0
     k = mod(k0, n3) + 1; kp = mod(k0 + 1, n3) + 1
 
     θbracket(ir) = @inbounds begin
-        j = clamp(bsearchlast_row(s.th_grid, ir, θ, n2), 1, n2 - 1)
-        a = s.th_grid[ir, j]
-        (j, clamp((θ - a)/(s.th_grid[ir, j+1] - a), zero(θ), one(θ)))
+        j = clamp(bsearchlast_row(g.th_grid, ir, θ, n2), 1, n2 - 1)
+        a = g.th_grid[ir, j]
+        (j, clamp((θ - a)/(g.th_grid[ir, j+1] - a), zero(θ), one(θ)))
     end
     ji, tji = θbracket(i); jp, tjp = θbracket(i + 1)
     return (; i, ti, k, kp, tk, ji, tji, jp, tjp)
@@ -674,6 +688,14 @@ _zero(::Type{T}) where {T<:NamedTuple} = T(map(_zero, fieldtypes(T)))
                                        _lerp(A[φ=st.kp, θ=jj, r=ir], A[φ=st.kp, θ=jj+1, r=ir], tj), st.tk)
     _lerp(face(st.i, st.ji, st.tji), face(st.i + 1, st.jp, st.tjp), st.ti)
 end
+
+@inline function _grid_sample(g::TensorGrid, A, q)
+    st = _sample_stencil(g, size(A, :φ), q...)
+    st === nothing ? nothing : _apply_stencil(st, A)
+end
+
+# `_lerp` with a weight promotes the zero to the interpolated type (Float32 field → Float64).
+@inline _grid_zero(g::TensorGrid, A) = (z0 = _zero(eltype(A)); _lerp(z0, z0, one(eltype(g.r_prof))))
 
 _rotation(::Val{M}) where {M} = M
 
@@ -719,26 +741,25 @@ Trilinearly interpolate the fluid record at the spin-frame Cartesian position `(
 
 # Returns
 - Record with the keys of `snapshot.fluid`, e.g. `(; ρ, ũ, B)`, vectors in spin-frame Kerr-Schild components, in the
-  grid precision (`eltype(snapshot.r_prof)`); zeros outside the grid.
+  grid precision (`eltype(snapshot.grid.r_prof)`); zeros outside the grid.
 """
 @inline function sample(s::GRMHDSnapshot, x, y, z)
-    A = s.fluid
     R = _rotation(s.R)
     p = SVector(x, y, z)
     q = R'*p
-    st = _sample_stencil(s, size(A, :φ), q...)
-    # `_lerp` with a weight promotes the out-of-grid zero to the interpolated type (Float32 field → Float64).
+    v = _grid_sample(s.grid, s.fluid, q)
     # Not converted: the frame is NaN at r = 0.
-    z0 = _zero(eltype(A))
-    st === nothing && return _lerp(z0, z0, one(eltype(s.r_prof)))
+    v === nothing && return _grid_zero(s.grid, s.fluid)
     fr = _sample_frame(R, p, q)
-    map(v -> _tospin(v, fr), _apply_stencil(st, A))
+    map(c -> _tospin(c, fr), v)
 end
 
 include("physics.jl")
 
+Adapt.adapt_structure(to, g::TensorGrid) =
+    TensorGrid(Adapt.adapt(to, g.r_prof), g.r_extent, Adapt.adapt(to, g.th_grid), g.φ0, g.dφ)
+
 Adapt.adapt_structure(to, s::GRMHDSnapshot) = GRMHDSnapshot(
-    Adapt.adapt(to, s.fluid), Adapt.adapt(to, s.r_prof), s.r_extent, Adapt.adapt(to, s.th_grid),
-    s.φ0, s.dφ, s.R, s.spin, s.gam, s.t, s.M_unit, s.MBH)
+    Adapt.adapt(to, s.fluid), Adapt.adapt(to, s.grid), s.R, s.spin, s.gam, s.t, s.M_unit, s.MBH)
 
 end
