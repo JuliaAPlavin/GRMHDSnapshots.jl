@@ -170,33 +170,36 @@ change, by multiples of `vʳ`. Singular at the horizons (Δ = 0), where BL is.
     SVector(v[1] - 2r/Δ*v[2], v[2], v[3], v[4] - a/Δ*v[2])
 end
 
-# ── Physical unit scalars (Unitful internally, stripped to plain CGS Float64 at the boundary — matching
-# the downstream synchrotron code, which is plain CGS). ──
+# ── Physical unit scalars: Unitful internally, plain CGS Float64 out — the field unit is CGS-Gaussian (Gauss), which
+# Unitful's SI dimensions cannot express, and the downstream synchrotron code is plain CGS. ──
+
+# A mass as a `SolarMass`, the form of the snapshot units; `nothing` (unknown) stays.
+_in_msun(m) = float(uconvert(u"Msun", m))
+_in_msun(::Nothing) = nothing
 
 # Scale-free dumps (e.g. iharm3d/KHARMA, H-AMR) may lack M_unit and/or MBH; fail loud naming the missing ones
 # rather than compute with `nothing`.
 function _require_units(snap::GRMHDSnapshot, f::Symbol, names::Symbol...)
     miss = filter(n -> getproperty(snap, n) === nothing, names)
-    units = (M_unit = "M☉", MBH = "M☉")
-    isempty(miss) || throw(ArgumentError("$f needs $(join(map(n -> "$n ($(units[n]))", miss), " and ")), missing from this snapshot; pass to the loader"))
+    isempty(miss) || throw(ArgumentError("$f needs $(join(miss, " and ")), missing from this snapshot; pass to the loader"))
 end
 
-# Gravitational radius G·MBH/c² in cm of a black-hole mass MBH in M☉.
-_rg_cm(MBH) = ustrip(u"cm", Unitful.G*(MBH*u"Msun")/Unitful.c0^2)
+# Gravitational radius G·MBH/c² of a black-hole mass MBH.
+_rg(MBH) = Unitful.G*MBH/Unitful.c0^2
 
 """
     lunit(snap)
 
 Gravitational radius r_g = G·MBH/c² in cm. Needs `MBH` only.
 """
-lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); _rg_cm(snap.MBH))
+lunit(snap::GRMHDSnapshot) = (_require_units(snap, :lunit, :MBH); ustrip(u"cm", _rg(snap.MBH)))
 
 """
     rhounit(snap)
 
-Code mass-density unit M_unit/r_g³ in g/cm³ (`M_unit` in M☉). Needs both `M_unit` and `MBH`.
+Code mass-density unit M_unit/r_g³ in g/cm³. Needs both `M_unit` and `MBH`.
 """
-rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); ustrip(u"g/cm^3", (Float64(snap.M_unit)*u"Msun")/(lunit(snap)*u"cm")^3))
+rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); ustrip(u"g/cm^3", snap.M_unit/_rg(snap.MBH)^3))
 
 """
     bunit(snap)
@@ -204,6 +207,20 @@ rhounit(snap::GRMHDSnapshot) = (_require_units(snap, :rhounit, :M_unit, :MBH); u
 Code field unit c·√(4π·ρ_unit) in Gauss. Needs both `M_unit` and `MBH`.
 """
 bunit(snap::GRMHDSnapshot) = (_require_units(snap, :bunit, :M_unit, :MBH); ustrip(u"cm/s", Unitful.c0)*sqrt(4π*rhounit(snap)))
+
+# Thomson cross-section (8π/3)·r_e², r_e = e²/(4πε₀mₑc²) the classical electron radius.
+const _σT = 8π/3*(Unitful.q^2/(4π*Unitful.ϵ0*Unitful.me*Unitful.c0^2))^2
+
+"""
+    eddington_mass_unit(MBH)
+    eddington_mass_unit(snap)
+
+The mass accreted at the Eddington rate L_Edd/c² (unit radiative efficiency) in one t_g = G·MBH/c³, in M☉; ∝ MBH².
+`M_unit = ṁ·eddington_mass_unit(MBH)` makes a run of code accretion rate Ṁ accrete at ṁ·Ṁ of that rate.
+The snapshot method needs `MBH`.
+"""
+eddington_mass_unit(MBH) = uconvert(u"Msun", 4π*Unitful.G*MBH*Unitful.mp/(Unitful.c0*_σT) * _rg(MBH)/Unitful.c0)
+eddington_mass_unit(snap::GRMHDSnapshot) = (_require_units(snap, :eddington_mass_unit, :MBH); eddington_mass_unit(snap.MBH))
 
 # ── Full-grid derived arrays, shaped and named like snap.fluid. For cell (φ=k,θ=j,r=i) of a `TensorGrid`: grid coords
 # r_prof[i], th_grid[i,j], φ0 + (k−1)·dφ; fluid record fluid[φ=k,θ=j,r=i]. Results are in the spin frame: vectors in its

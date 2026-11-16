@@ -16,7 +16,7 @@ using Zarr: zopen, ZGroup
 using ZarrZfp
 
 export GRMHDSnapshot, TensorGrid, BlockGrid, load_snapshot, resample, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
-    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit,
+    plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit, eddington_mass_unit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
 include("coordinates.jl")
@@ -82,9 +82,12 @@ _cells(c, n) = c*n .+ (0:n-1)
 # 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
 _relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
 
-# `M_unit` (code mass unit) and `MBH` (black-hole mass), both in M☉ — fits Float32, unlike grams — each carry their own
-# type parameter (`Um`, `Ub`): a number when known, `nothing` when not — scale-free dumps (e.g. iharm3d/KHARMA,
-# H-AMR, non-radiative koral) store neither, and each can be supplied independently.
+# a mass in M☉, of any real number type
+const SolarMass = Quantity{<:Real, dimension(u"Msun"), typeof(u"Msun")}
+
+# `M_unit` (code mass unit) and `MBH` (black-hole mass) are masses in M☉ (`SolarMass`; M☉ keeps them in Float32 range,
+# grams would not), each with its own type parameter (`Um`, `Ub`): `nothing` when unknown — scale-free dumps (e.g.
+# iharm3d/KHARMA, H-AMR, non-radiative koral) store neither, and each can be supplied independently.
 # The unit scalars needing an unknown one (`lunit`: MBH; `rhounit`/`bunit`: both) throw rather than compute with `nothing`.
 # `fluid` is an array of per-cell records, `(:φ,:θ,:r)` for a `TensorGrid`, `(:φ,:θ,:r,:block)` for a `BlockGrid`, with
 # the keys `ρ` (density), `ũ` (relative 4-velocity ũ^i) and `B` (lab field B^i), vectors in Kerr-Schild components of the
@@ -94,7 +97,7 @@ _relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((la
 # `R` turns grid Cartesian coordinates into the spin frame (black-hole spin along +z): the spin-frame point p is the grid
 # point Rᵀp. It is a `Val` of an integer `SMatrix`, so every kernel gets its entries as compile-time constants.
 # `sample` and the grid maps return vectors in spin-frame Kerr-Schild components.
-struct GRMHDSnapshot{F, G, T, Rt, Um, Ub}
+struct GRMHDSnapshot{F, G, T, Rt, Um<:Union{Nothing,SolarMass}, Ub<:Union{Nothing,SolarMass}}
     fluid::F
     grid::G
     R::Rt
@@ -152,7 +155,7 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 # Arguments
 - `path`: `.h5` file, or `.../RUN.zarr/snapNNNN` store snapshot path.
 - `kwargs...`: Forwarded to the selected loader; both take `fields = (:ρ, :ũ, :B)` (the fluid fields to read, a
-  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (both M☉), each overriding the header's value
+  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (masses, e.g. `6.5e9u"Msun"`), each overriding the header's value
   independently. Without them the header units are used for radiative runs only, as described for the store method
   `load_koral(store, snapname)`.
 
@@ -167,14 +170,15 @@ function load_koral(path::AbstractString; kwargs...)
         load_koral(zopen(dirname(p), "r")::ZGroup, basename(p); kwargs...)
 end
 
-# Units (M_unit, MBH, both in M☉) of a koral snapshot: each keyword if given, else from the header if the run is
-# radiative, else `nothing`. The header's `M_unit` is KORAL's rhoGU2CGS(1), a density in g/cm³, turned into a mass
-# (≈ M_bh: KORAL's mass unit) with r_g from the header's `M_bh`; it and `M_bh` are real only for radiative runs (as
-# in ipole): otherwise the run is scale-free and they are placeholders. `hdr()` gives the header's `(; M_unit, M_bh)`, read only when used.
+# Units (M_unit, MBH) of a koral snapshot: each keyword if given, else from the header if the run is radiative, else
+# `nothing`. The header's `M_unit` is KORAL's rhoGU2CGS(1), a density in g/cm³, turned into a mass (≈ M_bh: KORAL's
+# mass unit) with r_g from the header's `M_bh` [M☉]; it and `M_bh` are real only for radiative runs (as in ipole):
+# otherwise the run is scale-free and they are placeholders. `hdr()` gives the header's `(; M_unit, M_bh)`, read only when used.
 function _koral_units(radiative::Bool, hdr; M_unit, MBH)
     h = radiative ? hdr() : nothing
-    (M_unit = !isnothing(M_unit) ? M_unit : radiative ? ustrip(u"Msun", h.M_unit*u"g/cm^3"*(_rg_cm(h.M_bh)*u"cm")^3) : nothing,
-     MBH = !isnothing(MBH) ? MBH : radiative ? h.M_bh : nothing)
+    Mbh_hdr = radiative ? h.M_bh*u"Msun" : nothing
+    (M_unit = !isnothing(M_unit) ? _in_msun(M_unit) : radiative ? _in_msun(h.M_unit*u"g/cm^3"*_rg(Mbh_hdr)^3) : nothing,
+     MBH = !isnothing(MBH) ? _in_msun(MBH) : Mbh_hdr)
 end
 
 function load_koral_h5(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = nothing, MBH = nothing)
@@ -251,7 +255,7 @@ Load one snapshot from an open Zarr run store.
 - `snapname`: Snapshot group name, e.g. `"snap002000"`.
 - `fields`: Fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`.
 - `grid`: Cached grid from `load_grid(store)`.
-- `M_unit`, `MBH`: physical units (both M☉), each overriding the header independently. Otherwise both come from the
+- `M_unit`, `MBH`: physical units (masses, e.g. `6.5e9u"Msun"`; stored in M☉), each overriding the header independently. Otherwise both come from the
   header if the run is radiative (`has_radiation` present and nonzero), else are `nothing`: as in ipole, the header
   units are real only for radiative runs, a scale-free run stores placeholders. The header's `M_unit` is a density
   (g/cm³), converted to a mass with r_g from its `M_bh`, so `rhounit` is that density.
@@ -287,7 +291,7 @@ spatial Jacobian `J₃(r, θ)` (matching ipole's reconstruction), so the result 
 
 # Arguments
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
-- `M_unit`, `MBH`: physical units (code mass unit, black-hole mass), both in M☉, each optional (default `nothing`). These
+- `M_unit`, `MBH`: physical units (code mass unit, black-hole mass), masses (e.g. `6.5e9u"Msun"`; stored in M☉), each optional (default `nothing`). These
   dumps are scale-free (no units stored): `MBH` enables `lunit`, both together `rhounit`/`bunit`; those missing a unit throw.
 
 # Returns
@@ -324,7 +328,7 @@ function load_iharm(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = noth
 
         sc(x) = Float64(x)   # heterogeneous header scalars → uniform Float64 struct fields
         # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-        GRMHDSnapshot(fluid, TensorGrid(r_prof, th_grid, sc(sx3 + 0.5*dx3), sc(dx3)), Val(one(SMatrix{3,3,Int})), sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), M_unit, MBH)
+        GRMHDSnapshot(fluid, TensorGrid(r_prof, th_grid, sc(sx3 + 0.5*dx3), sc(dx3)), Val(one(SMatrix{3,3,Int})), sc(fmks("a")), sc(rd("header/gam")), sc(rd("t")), _in_msun(M_unit), _in_msun(MBH))
     end
 end
 
@@ -365,7 +369,7 @@ are placed at the standard cell centers of their block (see [`BlockGrid`](@ref))
 - `lazy`: `true` leaves the cells in the memory-mapped dump files and converts each one when it is read (same values),
   so nothing is held in memory per cell: for [`resample`](@ref) of dumps too large to load. Reading the same cell again
   converts it again.
-- `M_unit`, `MBH`: physical units (both M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
+- `M_unit`, `MBH`: physical units (masses), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.
@@ -393,7 +397,7 @@ function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = 
     grid = BlockGrid(coords, level, coord, nb, startx, ext0, r_extent)
 
     records = _hamr_records(collect(sel.cells), level, coord, startx, ext0, bs, coords, Rv, par.a, ks)
-    GRMHDSnapshot(NamedDimsArray(lazy ? records : _tcollect(records), (:φ, :θ, :r, :block)), grid, Rv, par.a, par.gam, par.t, M_unit, MBH)
+    GRMHDSnapshot(NamedDimsArray(lazy ? records : _tcollect(records), (:φ, :θ, :r, :block)), grid, Rv, par.a, par.gam, par.t, _in_msun(M_unit), _in_msun(MBH))
 end
 
 # The blocks' stored cells `cells[b]` (memory-mapped, φ, θ, r) as one read-only `(φ, θ, r, block)` array of the records of

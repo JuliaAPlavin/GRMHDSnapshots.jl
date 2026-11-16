@@ -133,28 +133,28 @@ end
 end
 
 @testitem "koral header units: radiative runs only, M_unit a density" begin
-    using HDF5, StaticArrays, Zarr
+    using HDF5, StaticArrays, Zarr, Unitful, UnitfulAstro
 
     # the header's M_unit is KORAL's rhoGU2CGS(1), a density: for a radiative run rhounit is it, and bunit the header's
     # own B_unit; keywords override each unit independently
     M_hdr, Mbh_hdr, B_hdr = 0.014610581643228402, 6.5e9, 1.2845747778405998e10
     function checkunits(ld)
         s = ld(; has_radiation = 1)
-        @test s.MBH === Mbh_hdr
+        @test s.MBH === Mbh_hdr*u"Msun"
         @test rhounit(s) ≈ M_hdr rtol = 1e-12
         @test bunit(s) ≈ B_hdr rtol = 1e-6
         # KORAL's mass unit is M_bh; they differ by the header's rounded constants. In M☉ it fits Float32.
-        @test s.M_unit ≈ 6.5e9 rtol = 1e-3
-        @test isfinite(Float32(s.M_unit))
-        @test ld(; has_radiation = 1, MBH = 4e6).MBH === 4e6
-        @test ld(; has_radiation = 1, MBH = 4e6).M_unit === s.M_unit
-        @test ld(; has_radiation = 1, M_unit = 5e-8).M_unit === 5e-8
-        @test ld(; has_radiation = 1, M_unit = 5e-8).MBH === Mbh_hdr
+        @test s.M_unit ≈ 6.5e9u"Msun" rtol = 1e-3
+        @test isfinite(Float32(ustrip(u"Msun", s.M_unit)))
+        @test ld(; has_radiation = 1, MBH = 4e6u"Msun").MBH === 4e6u"Msun"
+        @test ld(; has_radiation = 1, MBH = 4e6u"Msun").M_unit === s.M_unit
+        @test ld(; has_radiation = 1, M_unit = 5e-8u"Msun").M_unit === 5e-8u"Msun"
+        @test ld(; has_radiation = 1, M_unit = 5e-8u"Msun").MBH === Mbh_hdr*u"Msun"
         foreach((0, nothing)) do flag
             s = ld(; has_radiation = flag)
             @test s.M_unit === nothing && s.MBH === nothing
-            sk = ld(; has_radiation = flag, MBH = 6.5e9, M_unit = 5e-8)
-            @test sk.MBH === 6.5e9 && sk.M_unit === 5e-8
+            sk = ld(; has_radiation = flag, MBH = 6.5e9u"Msun", M_unit = 5e-8u"Msun")
+            @test sk.MBH === 6.5e9u"Msun" && sk.M_unit === 5e-8u"Msun"
         end
     end
 
@@ -170,7 +170,7 @@ end
     end)
     zpath(flag) = flag == 0 ? src : zcopies[flag]
     checkunits((; has_radiation, kw...) -> load_koral(zopen(zpath(has_radiation), "r"), "snap002000"; fields = (:ρ,), kw...))
-    @test load_koral(joinpath(zpath(1), "snap002000"); MBH = 4e6).MBH === 4e6
+    @test load_koral(joinpath(zpath(1), "snap002000"); MBH = 4e6u"Msun").MBH === 4e6u"Msun"
 
     # synthetic koral .h5: datasets indexed (φ, θ, r), r depending on r only, θ on (θ, r), φ on φ, uniformly spaced
     n3, n2, n1 = 4, 3, 5
@@ -223,13 +223,13 @@ end
 end
 
 @testitem "plasma physics" begin
-    using StaticArrays, Zarr, NamedDims, Accessors
+    using StaticArrays, Zarr, NamedDims, Accessors, Unitful, UnitfulAstro
     using LinearAlgebra: det
     using GRMHDSnapshots: plasma_state, ks_gcov, spatial_norm
 
     store = zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r")
     # the fixture run is non-radiative, so scale-free: units given explicitly
-    snap = load_koral(store, "snap002000"; MBH = 6.5e9, M_unit = 5e-8)
+    snap = load_koral(store, "snap002000"; MBH = 6.5e9u"Msun", M_unit = 5e-8u"Msun")
     a = snap.spin
 
     # Physical invariants of the reconstructed plasma state at sampled cells:
@@ -300,7 +300,7 @@ end
     @test map_plasma((_, _, c) -> c.ρ, snap) == map(c -> c.ρ, snap.fluid)
 
     # comoving_bsq/comoving_B_gauss reconstruct b from ũ and B only — no ρ needed.
-    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B), MBH = 6.5e9, M_unit = 5e-8)
+    snap_bv = load_koral(store, "snap002000"; fields = (:ũ, :B), MBH = 6.5e9u"Msun", M_unit = 5e-8u"Msun")
     @test !hasfield(eltype(snap_bv.fluid), :ρ)
     @test comoving_bsq(snap_bv) == bsqg
     @test comoving_B_gauss(snap_bv) == comoving_B_gauss(snap)
@@ -337,9 +337,9 @@ end
     # run: without keywords it has none.
     snap0 = load_koral(store, "snap002000")
     @test snap0.M_unit === nothing && snap0.MBH === nothing
-    @test_throws "lunit needs MBH (M☉)" lunit(snap0)
+    @test_throws "lunit needs MBH" lunit(snap0)
     unitsof(s) = map(f -> f(s), [lunit, rhounit, bunit])
-    @test snap.MBH === 6.5e9 && snap.M_unit === 5e-8
+    @test snap.MBH === 6.5e9u"Msun" && snap.M_unit === 5e-8u"Msun"
     @test unitsof(snap) isa Vector{Float64}
     @test lunit(snap) ≈ 9.598062747325812e14
     Msun_g = 1.98841e33                                         # M☉ in g, independent of the package's Unitful path
@@ -347,12 +347,33 @@ end
     @test bunit(snap) ≈ 2.99792458e10*sqrt(4π*rhounit(snap))
     # Float32 scalars (as after a whole-snapshot Float32 conversion) still give Float64 units, also where r_g³ in cm³
     # or a large M_unit in grams would overflow Float32.
-    snap32 = setproperties(snap, (; grid = setproperties(snap.grid, map(Float32, (; snap.grid.φ0, snap.grid.dφ))),
-                                    map(Float32, (; snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH))...))
-    @test snap32.MBH isa Float32 && snap32.M_unit isa Float32
+    f32(x) = Float32(x)
+    f32(x::Quantity) = convert(Quantity{Float32}, x)
+    snap32 = setproperties(snap, (; grid = setproperties(snap.grid, map(f32, (; snap.grid.φ0, snap.grid.dφ))),
+                                    map(f32, (; snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH))...))
+    @test snap32.MBH isa Quantity{Float32} && snap32.M_unit isa Quantity{Float32}
     @test unitsof(snap32) isa Vector{Float64}
     @test unitsof(snap32) ≈ unitsof(snap) rtol = 1e-6
-    @test unitsof(@set snap32.M_unit = 1f10) ≈ unitsof(@set snap.M_unit = 1e10) rtol = 1e-6
+    @test unitsof(@set snap32.M_unit = 1f10u"Msun") ≈ unitsof(@set snap.M_unit = 1e10u"Msun") rtol = 1e-6
+
+    # the units are masses, stored in M☉ whatever unit they are given in; a plain number is no mass
+    sg = load_koral(store, "snap002000"; fields = (:ρ,), MBH = 1.2924663e43u"g", M_unit = 1e19u"g")
+    @test sg.MBH isa typeof(1.0u"Msun") && sg.M_unit isa typeof(1.0u"Msun")
+    @test sg.MBH ≈ 6.5e9u"Msun" rtol = 1e-6
+    @test lunit(sg) ≈ lunit(snap) rtol = 1e-6
+    @test_throws Unitful.DimensionError load_koral(store, "snap002000"; fields = (:ρ,), MBH = 6.5e9)
+    @test_throws MethodError @set snap.M_unit = 5e-8
+
+    # Eddington mass unit: L_Edd/c² = 1.2572e38 erg/s / c² = 1.39883e17 g/s per M☉, t_g = 4.925491e-6 s per M☉
+    # ⇒ 6.8899e11 g·(MBH/M☉)², 0.013320 M☉ for 6.2e9 M☉
+    @test GRMHDSnapshots._σT ≈ 6.6524587051e-25u"cm^2" rtol = 1e-8         # CODATA 2018/2022
+    @test eddington_mass_unit(6.2e9u"Msun") ≈ 0.013320u"Msun" rtol = 1e-3
+    @test eddington_mass_unit(6.2e9u"Msun") isa typeof(1.0u"Msun")
+    @test eddington_mass_unit(12.4e9u"Msun") ≈ 4*eddington_mass_unit(6.2e9u"Msun") rtol = 1e-12
+    @test eddington_mass_unit(uconvert(u"kg", 6.2e9u"Msun")) ≈ eddington_mass_unit(6.2e9u"Msun") rtol = 1e-12
+    @test eddington_mass_unit(6.2f9u"Msun") ≈ eddington_mass_unit(6.2e9u"Msun") rtol = 1e-6
+    @test eddington_mass_unit(snap) === eddington_mass_unit(snap.MBH)
+    @test_throws "eddington_mass_unit needs MBH" eddington_mass_unit(snap0)
 
     # Kernel type stability on Float64 inputs.
     @inferred plasma_state(SVector(0.1, 0.2, 0.3), SVector(0.4, 0.5, 0.6), 5.0, 1.0, a)
@@ -619,7 +640,7 @@ end
 end
 
 @testitem "iharm FMKS loader: synthetic round-trip" begin
-    using HDF5, StaticArrays, NamedDims, Accessors
+    using HDF5, StaticArrays, NamedDims, Accessors, Unitful, UnitfulAstro
     using GRMHDSnapshots: FMKS, bl_coord, jacobian_spatial, plasma_state, ks_gcov
 
     # Write a tiny valid FMKS dump and load it — exercises header parsing, prims unpacking, the grid
@@ -655,21 +676,21 @@ end
     @test snap.grid.φ0 ≈ sx3 + 0.5dx3 && snap.grid.dφ ≈ dx3                 # φ = X3, no +π offset
 
     # units are independently optional: lunit needs MBH only, rhounit/bunit both; errors name the missing ones.
-    @test_throws "lunit needs MBH (M☉)" lunit(snap)
-    foreach(f -> @test_throws("$f needs M_unit (M☉) and MBH (M☉)", f(snap)), (rhounit, bunit))
-    snapb = load_iharm(path; MBH = 6.5e9)
-    @test snapb.M_unit === nothing
+    @test_throws "lunit needs MBH," lunit(snap)
+    foreach(f -> @test_throws("$f needs M_unit and MBH,", f(snap)), (rhounit, bunit))
+    snapb = load_iharm(path; MBH = 6.5e9u"Msun")
+    @test snapb.M_unit === nothing && snapb.MBH === 6.5e9u"Msun"
     @test lunit(snapb) ≈ 9.598062747325812e14
-    foreach(f -> @test_throws("$f needs M_unit (M☉)", f(snapb)), (rhounit, bunit))
-    snapm = load_iharm(path; M_unit = 5e-8)
-    @test snapm.MBH === nothing
-    foreach(f -> @test_throws("$f needs MBH (M☉)", f(snapm)), (lunit, rhounit, bunit))
+    foreach(f -> @test_throws("$f needs M_unit,", f(snapb)), (rhounit, bunit))
+    snapm = load_iharm(path; M_unit = 5e-8u"Msun")
+    @test snapm.MBH === nothing && snapm.M_unit === 5e-8u"Msun"
+    foreach(f -> @test_throws("$f needs MBH,", f(snapm)), (lunit, rhounit, bunit))
     # setting the other unit later (as downstream viewers do for M_unit) rebuilds the snapshot with its new type
-    snapbm = @set snapb.M_unit = 5e-8
-    @test snapbm.M_unit === 5e-8 && snapbm.fluid == snap.fluid
+    snapbm = @set snapb.M_unit = 5e-8u"Msun"
+    @test snapbm.M_unit === 5e-8u"Msun" && snapbm.fluid == snap.fluid
     Msun_g = 1.98841e33                                         # M☉ in g, independent of the package's Unitful path
     @test isapprox(rhounit(snapbm), 5e-8*Msun_g/lunit(snapb)^3; rtol = 1e-4) && bunit(snapbm) ≈ 2.99792458e10*sqrt(4π*rhounit(snapbm))
-    @test rhounit(@set snapm.MBH = 6.5e9) == rhounit(snapbm)
+    @test rhounit(@set snapm.MBH = 6.5e9u"Msun") == rhounit(snapbm)
     @test (@set snapbm.M_unit = nothing).M_unit === nothing
 
     @test (r_min(snap), r_max(snap)) == (snap.grid.r_prof[1], snap.grid.r_prof[end])
@@ -688,7 +709,7 @@ end
 end
 
 @testitem "iharm FMKS loader: real data + pyharm golden (optional, isfile-guarded)" begin
-    using StaticArrays, NamedDims
+    using StaticArrays, NamedDims, Unitful, UnitfulAstro
     using GRMHDSnapshots: plasma_state, ks_gcov
 
     path = joinpath(@__DIR__, "data", "iharm_fmks_a0.h5")
@@ -700,7 +721,7 @@ end
 
         # lazy units: scale-free by default ⇒ throw; supplied ⇒ positive scalars.
         @test_throws ArgumentError lunit(snap)
-        snapu = load_iharm(path; M_unit = 5e-8, MBH = 6.5e9)
+        snapu = load_iharm(path; M_unit = 5e-8u"Msun", MBH = 6.5e9u"Msun")
         @test lunit(snapu) > 0 && rhounit(snapu) > 0 && bunit(snapu) > 0
         # auto-detect routes an FMKS .h5 to load_iharm.
         @test load_snapshot(path).fluid == snap.fluid
@@ -893,7 +914,7 @@ end
 end
 
 @testitem "H-AMR loader: new layout, real data (optional, isfile-guarded)" begin
-    using StaticArrays, NamedDims, LinearAlgebra, ForwardDiff
+    using StaticArrays, NamedDims, LinearAlgebra, ForwardDiff, Unitful, UnitfulAstro
     using GRMHDSnapshots: ks_gcov, snapshot_format
 
     # dumps10000 with the run's grid in the sibling `gdumps/` (toolkit layout)
@@ -1034,8 +1055,8 @@ end
         sl = load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,))
         @test sl.grid isa BlockGrid && parent(sl.fluid) == parent(load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid)
         @test resample(sl).fluid == map(c -> (; c.ρ), snap.fluid)
-        snapb = ld(rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
-        @test snapb.MBH === 6.5e9 && snapb.M_unit === nothing && lunit(snapb) ≈ 9.598062747325812e14
+        snapb = ld(rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9u"Msun")
+        @test snapb.MBH === 6.5e9u"Msun" && snapb.M_unit === nothing && lunit(snapb) ≈ 9.598062747325812e14
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
     end
@@ -1389,12 +1410,12 @@ end
 end
 
 @testitem "resample: BlockGrid → TensorGrid on synthetic grids" begin
-    using StaticArrays, NamedDims
+    using StaticArrays, NamedDims, Unitful, UnitfulAstro
     using GRMHDSnapshots: HAMRSph, bl_coord
     using GRMHDSnapshots.IntervalSets: Interval
 
     I3 = Val(one(SMatrix{3,3,Int}))
-    mk(A, grid) = GRMHDSnapshot(NamedDimsArray(A, ndims(A) == 3 ? (:φ, :θ, :r) : (:φ, :θ, :r, :block)), grid, I3, 0.9, 4/3, 1.5, 2.0, 3.0)
+    mk(A, grid) = GRMHDSnapshot(NamedDimsArray(A, ndims(A) == 3 ? (:φ, :θ, :r) : (:φ, :θ, :r, :block)), grid, I3, 0.9, 4/3, 1.5, 2.0u"Msun", 3.0u"Msun")
 
     # one level: 2×2×2 level-0 blocks of 4×3×5 cells (r, θ, φ) reproduce the tensor grid of the same cells exactly
     nb = (2, 2, 2); bs = (4, 3, 5); n = nb .* bs
