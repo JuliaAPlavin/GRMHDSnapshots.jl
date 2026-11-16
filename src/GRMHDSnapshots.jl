@@ -6,8 +6,8 @@ using LinearAlgebra: Diagonal, cross
 using IntervalSets
 using Unitful, UnitfulAstro
 using NamedDims: NamedDimsArray
-using DataManipulation: filtermap, flatmap, group
-using OhMyThreads: tmap, tforeach, @tasks, @local, chunks
+using DataManipulation: filtermap, flatmap
+using OhMyThreads: tforeach, @tasks, chunks
 import StructArrays
 import ForwardDiff
 import Adapt
@@ -15,7 +15,7 @@ import Mmap
 using Zarr: zopen, ZGroup
 using ZarrZfp
 
-export GRMHDSnapshot, TensorGrid, BlockGrid, load_snapshot, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
+export GRMHDSnapshot, TensorGrid, BlockGrid, load_snapshot, resample, load_koral, load_iharm, load_hamr, load_grid, r_min, r_max,
     plasma_state, map_plasma, fluid_ucon, fluid_velocity, flow_speed, proper_velocity, lapse, grav_redshift, volume_ratio, ks_to_bl, lunit, rhounit, bunit,
     comoving_bsq, comoving_B_gauss, bfield_magnitude, magnetization
 
@@ -76,6 +76,9 @@ _cell_center(x0, e, n, l, i) = x0 + (2i + 1)*(e/(2(n << l)))
 _block_centers(startx, ext0, l, c, bs) =
     map((x0, e, l, c, n) -> map(i -> _cell_center(x0, e, n, l, c*n + i), 0:n-1), Tuple(startx), Tuple(ext0), Tuple(l), Tuple(c), bs)
 
+# The 0-based cells, at its own level, of a block at position `c` with `n` cells, in one direction.
+_cells(c, n) = c*n .+ (0:n-1)
+
 # 0-based cells at level L+s covering the 0-based cells `rng` at level L (dyadic grids aligned at startx).
 _relevel(rng::AbstractUnitRange, s::Integer) = s ≥ 0 ? ((first(rng) << s):((last(rng) + 1) << s) - 1) : ((first(rng) >> -s):(last(rng) >> -s))
 
@@ -109,7 +112,8 @@ Load a single GRMHD snapshot, auto-detecting the on-disk format:
 - `.h5` with a `prims` dataset → iharm3d/KHARMA FMKS ([`load_iharm`](@ref));
 - `.h5` with a `quants/` group → koral ([`load_koral`](@ref));
 - a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref));
-- a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` and `spin_axis` kwargs).
+- a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` and `spin_axis` kwargs):
+  the dump's native blocks on a [`BlockGrid`](@ref), which [`resample`](@ref) turns into the uniform grid.
 
 `kwargs...` go to the selected loader. Every loader accepts `fields` (a nonempty subset of `(:ρ, :ũ, :B)`) and
 `M_unit`/`MBH`; use the explicit loaders for their format-specific options.
@@ -328,94 +332,93 @@ end
 _cellmap(fs::NamedTuple, n) = [map(f -> f(k, j, i), fs) for k in 1:n[1], j in 1:n[2], i in 1:n[3]]
 
 """
-    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, maxlevel=(;), fields=(:ρ, :ũ, :B), M_unit=nothing, MBH=nothing)
+    load_hamr(dir; rcyl, spin_axis, rmin=nothing, rmax=nothing, fields=(:ρ, :ũ, :B), M_unit=nothing, MBH=nothing)
 
-Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …), restricted to the radial cells
-whose centers lie in `[rmin, rmax]`. Only the blocks overlapping that range are read, and only their radial slabs within it.
+Load an H-AMR native dump directory (`parameters`, `new_dump0`, `new_dump1`, …) as its own AMR blocks, without
+resampling: a [`GRMHDSnapshot`](@ref) on a [`BlockGrid`](@ref), `fluid` indexed `(:φ, :θ, :r, :block)`. `sample`
+returns the nearest stored cell's record; [`resample`](@ref) turns it into a uniform [`TensorGrid`](@ref) snapshot.
+
+Radial selection is by whole blocks: those whose radial extent overlaps `[rmin, rmax]` are kept, and `r_extent` of
+the grid is `[rmin, rmax]` clipped to the grid's radial range.
 
 Both `parameters` layouts are supported, told apart by the file size: the old one (refinement in φ only, block
 metadata in `dir/grid`) and the new one (refinement in each direction, block metadata in the run's
 `gdumps/grid`, `grid1`, … next to `dir`, i.e. `joinpath(dirname(dir), "gdumps", "grid")`).
 
-The result is an ordinary uniform [`GRMHDSnapshot`] at one refinement level per direction: the finest level among the
-blocks whose radial extent overlaps `[rmin, rmax]`, capped by `maxlevel`. Each output cell is the average of the
-stored cells it overlaps, weighted by the overlap in native coordinates: a coarser stored cell is copied into every
-output cell it covers, finer ones are averaged. Without caps every output cell is a copy of one stored cell.
-
 The dump stores the 4-velocity `u^μ` and lab field `B^i` in native components; each stored cell is transformed to
 Kerr-Schild components at its own center via the analytic spatial Jacobian, and `u^μ` is converted to the relative
-velocity `ũ^i` with the Kerr-Schild metric of the spin frame at the cell center's spin-frame colatitude, before
-averaging. Stored values are used without correction, placed at the standard cell centers
-`startx + (i + 1/2)·h` (`i` the 0-based cell index, `h` the cell spacing at the block's level). The `fluid` records are
-`Float32` (the dump precision); transforms and averages are computed in `Float64`.
+velocity `ũ^i` with the Kerr-Schild metric of the spin frame at the cell center's spin-frame colatitude. Stored values
+are placed at the standard cell centers of their block (see [`BlockGrid`](@ref)). The `fluid` records are `Float32`
+(the dump precision); transforms are computed in `Float64`.
 
 # Arguments
 - `rcyl`: the run's θ coordinates, required since they are not stored in the dump files. A number is the
   cylindrification radius ([`HAMRCyl`](@ref); HARMPI `global_x10 = log(rcyl)`; 24.32 for the EHT code-comparison
   run), assuming cylindrified Gammie θ with hslope = 1 and HARMPI's default corner `x20 = -1 + 1/n2` (`n2` the
-  θ cell count); old layout only. `nothing` is plain θ = π/2·(1 + X2) ([`HAMRSph`](@ref)).
+  θ cell count); old layout only. Such a grid loads, and the grid maps work on it, but point lookup (`sample`) does
+  not. `nothing` is plain θ = π/2·(1 + X2) ([`HAMRSph`](@ref)).
 - `spin_axis`: the black-hole spin direction in grid Cartesian coordinates, required since the dumps do not store it: one
   of `(1, 0, 0)`, `(-1, 0, 0)`, `(0, 1, 0)`, `(0, -1, 0)`, `(0, 0, 1)`; e.g. `(0, 0, 1)` for the EHT code-comparison
   run.
-- `rmin`, `rmax`: radial range of cell centers; `nothing` extends to the grid edge.
-- `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
-  each a nonnegative integer, or `nothing` for no cap.
+- `rmin`, `rmax`: radial range; `nothing` extends to the grid edge.
 - `fields`: fluid fields to read; a nonempty subset of `(:ρ, :ũ, :B)`. The `fluid` records hold these, in the order `(ρ, ũ, B)`.
 - `M_unit`, `MBH`: physical units (both M☉), each optional, as for [`load_iharm`](@ref) (the dumps store none).
 
 # Returns
 - `GRMHDSnapshot` whose `R` is the smallest rotation taking `spin_axis` to +z.
 """
-function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = nothing, maxlevel::NamedTuple = (;),
-                   fields = (:ρ, :ũ, :B), M_unit = nothing, MBH = nothing)
+function load_hamr(dir::AbstractString; rcyl, spin_axis, rmin = nothing, rmax = nothing, fields = (:ρ, :ũ, :B),
+                   M_unit = nothing, MBH = nothing)
     ks = _fluid_keys(fields)
-    keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
-    all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
-        throw(ArgumentError("maxlevel values must be nonnegative integers or nothing, got $maxlevel"))
     Rv = _hamr_rotation(spin_axis)
     par = _hamr_parameters(joinpath(dir, "parameters"))
     coords = _hamr_coords(par.layout, rcyl, par)
     blocks = _hamr_blocks(dir, par)
-    (; bs, nb, startx, dx) = par
+    (; bs, nb, dx) = par
+    startx = SVector{3,Float64}(par.startx)
+    ext0 = SVector{3,Float64}(dx .* bs)
 
-    # output level per direction: the finest among the blocks whose radial extent overlaps the range, capped;
-    # uncapped, the output is then at least as fine as every block holding an output cell
+    # whole blocks whose radial extent overlaps the range
     rsel = something(rmin, 0)..something(rmax, Inf)
-    nocells() = ArgumentError("no radial cell centers in [$rmin, $rmax]; the grid spans r = $(exp(startx[1])) … $(exp(startx[1] + nb[1]*bs[1]*dx[1]))")
+    rgrid = exp(startx[1])..exp(startx[1] + nb[1]*bs[1]*dx[1])
+    r_extent = rsel ∩ rgrid
+    isempty(r_extent) && throw(ArgumentError("no grid radii in [$rmin, $rmax]; the grid spans r = $(leftendpoint(rgrid)) … $(rightendpoint(rgrid))"))
     redge(b, c) = exp(startx[1] + c*bs[1]*dx[1]/2^b.level[1])
-    near = filter(b -> !isempty((redge(b, b.coord[1])..redge(b, b.coord[1] + 1)) ∩ rsel), blocks)
-    isempty(near) && throw(nocells())
-    finest = ntuple(d -> maximum(b -> b.level[d], near), 3)
-    tl = map((l, k) -> min(something(get(maxlevel, k, nothing), l), l), finest, (:r, :θ, :φ))
-    X(d, i) = _hamr_center(par, d, tl[d], i)
-    n = nb .* bs .* 2 .^ tl
-    # 0-based output radial cells; contiguous since r grows with the index
-    c = filter(i -> exp(X(1, i)) ∈ rsel, 0:n[1]-1)
-    isempty(c) && throw(nocells())
-    ir = first(c):last(c)
+    sel = filter(b -> !isempty((redge(b, b.coord[1])..redge(b, b.coord[1] + 1)) ∩ rsel), blocks)
+    level = map(SVector{3,Int32}, sel.level)
+    coord = map(SVector{3,Int32}, sel.coord)
+    grid = BlockGrid(coords, level, coord, nb, startx, ext0, r_extent)
 
-    r_prof  = map(i -> exp(X(1, i)), ir)
-    th_grid = [last(bl_coord(coords, X(1, i), X(2, j))) for i in ir, j in 0:n[2]-1]
-
-    zero32 = (ρ = 0f0, ũ = zero(SVector{3,Float32}), B = zero(SVector{3,Float32}))
-    outs = Array{typeof(zero32[ks])}(undef, n[3], n[2], length(ir))
-    rel = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ ir), blocks)    # every block contributing to the output
-    geo = :ũ in ks || :B in ks ? _hamr_cell_geometry(rel, par, coords, tl, ir) : nothing
-    # Float64 sums for averaged cells; weights add to 1 per output cell since blocks tile, `w > 0` marks them
-    z = merge((; w = 0.0), (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks])
-    # each task owns whole radial chunks of the output (a few per thread, for balance), so no two tasks write the same cell
-    @tasks for cr in chunks(ir; n = 4Threads.nthreads())
-        @local row = Vector{typeof(z)}(undef, bs[3])
-        cbs = filter(b -> !isempty(_hamr_outcells(b, bs, tl) ∩ cr), rel)
-        ro = first(cr) - first(ir)
-        sums = all(b -> _hamr_iscopy(b, tl), cbs) ? nothing : fill(z, n[3], n[2], length(cr))
-        foreach(b -> _hamr_scatter!(_hamr_iscopy(b, tl) ? outs : sums, ro, row, b, par, geo, Rv, tl, cr), cbs)
-        isnothing(sums) || foreach(I -> iszero(sums[I].w) || _hamr_put!(outs, ro, Tuple(I)..., sums[I], 1), CartesianIndices(sums))
+    z = (ρ = 0.0, ũ = zero(SVector{3,Float64}), B = zero(SVector{3,Float64}))[ks]
+    fluid = Array{typeof(map(x -> Float32.(x), z))}(undef, bs[3], bs[2], bs[1], length(sel))
+    # each task writes only its own blocks
+    tforeach(eachindex(sel)) do b
+        X = _block_centers(startx, ext0, level[b], coord[b], bs)
+        _hamr_native_block!(view(fluid, :, :, :, b), sel.cells[b], X, coords, Rv, par.a, typeof(z))
     end
+    GRMHDSnapshot(NamedDimsArray(fluid, (:φ, :θ, :r, :block)), grid, Rv, par.a, par.gam, par.t, M_unit, MBH)
+end
 
-    # φ = X3 (zone-centered); no +π offset (that is specific to the koral converter).
-    GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), TensorGrid(r_prof, th_grid, X(3, 0), dx[3]/2^tl[3]),
-        Rv, par.a, par.gam, par.t, M_unit, MBH)
+# A block's stored cells `cells` into `out` (both φ, θ, r), each converted to KS at its own center (native centers `X`
+# per direction (r, θ, φ)) as `E`, then stored in `out`'s precision.
+function _hamr_native_block!(out::AbstractArray{Rec}, cells, X, coords, Rv, a, ::Type{E}) where {Rec, E}
+    R = _rotation(Rv)
+    φs = map(sincos, X[3])
+    for il in axes(out, 3), jl in axes(out, 2)
+        gc = _hamr_center_geometry(E, coords, X[1][il], X[2][jl])
+        for kl in axes(out, 1)
+            @inbounds out[kl, jl, il] = convert(Rec, _hamr_ks(ltoh.(cells[kl, jl, il]), gc, φs[kl], R, a, E))
+        end
+    end
+    out
+end
+
+# `(; J, r, sθ, cθ)` at native (X1, X2) for `_hamr_ks`; `nothing` for ρ alone, which needs none.
+_hamr_center_geometry(::Type{<:NamedTuple{(:ρ,)}}, coords, X1, X2) = nothing
+function _hamr_center_geometry(::Type, coords, X1, X2)
+    r, θ = bl_coord(coords, X1, X2)
+    sθ, cθ = sincos(θ)
+    (; J = jacobian_spatial(coords, X1, X2), r, sθ, cθ)
 end
 
 const _HAMR_SPIN_AXES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1))
@@ -435,74 +438,12 @@ end
 # One stored cell: rho, ug, u^0..3, B^1..3, little-endian float32.
 const HAMRCell = SVector{9,Float32}
 
-# Native coordinate in direction d of the center of 0-based cell i at refinement level l.
-_hamr_center(par, d, l, i) = par.startx[d] + (i + 1/2)*par.dx[d]/2^l
-
-# 0-based cells of block `b` in direction d, at its own level.
-_hamr_cells(b, bs, d) = b.coord[d]*bs[d] .+ (0:bs[d]-1)
-
-# 0-based output radial cells, at target levels `tl`, overlapping block `b`.
-_hamr_outcells(b, bs, tl) = _relevel(_hamr_cells(b, bs, 1), tl[1] - b.level[1])
-
-# Spatial Jacobian, r and (sin θ, cos θ) at the stored cell centers, computed once per (r level, θ level, i, j) the blocks
-# need: for each (r level, θ level), the 0-based first cells (i0, j0) and the matrix of (; J, r, sθ, cθ) from there.
-function _hamr_cell_geometry(blocks, par, coords, tl, ir)
-    span(d, bl) = minimum(b -> first(_hamr_cells(b, par.bs, d)), bl):maximum(b -> last(_hamr_cells(b, par.bs, d)), bl)
-    map(group(b -> b.level[1:2], blocks)) do bl
-        (l1, l2) = first(bl).level
-        ii = _relevel(ir, l1 - tl[1]) ∩ span(1, bl)
-        jj = span(2, bl)
-        M = tmap(CartesianIndices((ii, jj))) do I
-            X1 = _hamr_center(par, 1, l1, I[1]); X2 = _hamr_center(par, 2, l2, I[2])
-            r, θ = bl_coord(coords, X1, X2)
-            sθ, cθ = sincos(θ)
-            (; J = jacobian_spatial(coords, X1, X2), r, sθ, cθ)
-        end
-        (; i0 = first(ii), j0 = first(jj), M)
-    end
-end
-
-# block no finer than the output: each output cell lies in one stored cell, written directly
-_hamr_iscopy(b, tl) = all(≥(0), tl .- b.level)
-
-# Into the output records (radial offset `ro`): the cell without its weight, in the output precision.
-Base.@propagate_inbounds _hamr_put!(outs::AbstractArray{R}, ro, ko, jo, it, c, w) where {R} = outs[ko, jo, it + ro] = convert(R, NamedTuple{fieldnames(R)}(c))
-# Into the sums, which have the cell's own element type: weighted accumulation.
-Base.@propagate_inbounds _hamr_put!(sums::AbstractArray{E}, ro, ko, jo, it, c::E, w) where {E} = sums[ko, jo, it] = map((x, y) -> x + w*y, sums[ko, jo, it], c)
-
-# Put block `b`'s stored cells overlapping the output radial cells `cr` into `sink` (radial index local to `cr`), each
-# converted to KS at its own center (spin frame from the rotation `Rv`) and weighted by its overlap. Stored cells: φ
-# fastest, then θ, then r.
-function _hamr_scatter!(sink, ro, row, b, par, geo, Rv, tl, cr)
-    (; bs) = par
-    R = _rotation(Rv)
-    s = tl .- b.level
-    w = exp2(sum(min.(s, 0)))
-    o = b.coord .* bs
-    ii = _relevel(cr, -s[1]) ∩ _hamr_cells(b, bs, 1)
-    cells = view(b.cells, :, :, ii .- (o[1] - 1))
-    G = isnothing(geo) ? nothing : geo[b.level[1:2]]
-    φs = map(kl -> sincos(_hamr_center(par, 3, b.level[3], o[3] + kl - 1)), 1:bs[3])
-    # output φ cells of stored φ cell kl: k0(kl) .+ (1:nk)
-    k0(kl) = first(_relevel((o[3] + kl - 1):(o[3] + kl - 1), s[3]))
-    nk = 1 << max(s[3], 0)
-    for (il, i) in enumerate(ii), jl in 1:bs[2]
-        j = o[2] + jl - 1
-        gc = isnothing(G) ? nothing : G.M[i - G.i0 + 1, j - G.j0 + 1]
-        # convert each stored cell of the φ row once, then put it into every output cell it overlaps
-        map!(kl -> _hamr_ks(ltoh.(cells[kl, jl, il]), gc, φs[kl], R, par.a, eltype(row)), row, 1:bs[3])
-        for it in _relevel(i:i, s[1]) ∩ cr .- (first(cr) - 1), jo in _relevel(j:j, s[2]) .+ 1, kl in 1:bs[3], q in 1:nk
-            @inbounds _hamr_put!(sink, ro, k0(kl) + q, jo, it, row[kl], w)
-        end
-    end
-end
-
-# Stored cell `p` with KS components at its center (geometry `gc`, (sin φ, cos φ) of its φ), as the sums element type `E`:
-# unit weight `w`, then the requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by
-# the static `K` keeps it type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column. ũ takes the
-# spin-frame metric at the center's spin-frame direction n.
+# Stored cell `p` with KS components at its center (geometry `gc`, (sin φ, cos φ) of its φ), as the record type `E` of
+# the requested fields. Only the selected thunks run (`gc` is `nothing` for ρ alone); selecting by the static `K` keeps it
+# type-stable. u^t is unchanged: the native↔KS Jacobian has a trivial t row/column. ũ takes the spin-frame metric at the
+# center's spin-frame direction n.
 function _hamr_ks(p::HAMRCell, gc, (sφ, cφ), R, a, ::Type{E}) where {K, E<:NamedTuple{K}}
-    fs = (w = () -> 1.0, ρ = () -> p[1],
+    fs = (ρ = () -> p[1],
           ũ = () -> let n = R*SVector(gc.sθ*cφ, gc.sθ*sφ, gc.cθ)
               gammie_uprim(SVector(p[3], (gc.J*p[SVector(4, 5, 6)])...), _ks_gcov_sq(gc.r, n[3]^2, n[1]^2 + n[2]^2, a))
           end,
@@ -644,6 +585,92 @@ function _hamr_grid_records(gpath, nmax, ids)
         Int.(ltoh.(view(recs[p], :, id - firstid[p] + 1)))
     end
 end
+
+"""
+    resample(snapshot; maxlevel=(;))
+
+The snapshot of a [`BlockGrid`](@ref) on a uniform [`TensorGrid`](@ref), at one refinement level per direction: the
+finest level among its blocks, capped by `maxlevel`. The radial cells are those of that level whose centres lie in the
+grid's `r_extent`; θ and φ span the whole grid.
+
+Each output cell is the average of the stored cells it overlaps, weighted by the overlap in native coordinates: a coarser
+or equal stored cell is copied into every output cell it covers, finer ones are averaged (in `Float64`, stored in the
+fluid's own precision). Without caps every output cell is a copy of one stored cell. Throws if an output cell reaches
+beyond the snapshot's blocks.
+
+# Arguments
+- `snapshot`: `GRMHDSnapshot` on a `BlockGrid`, e.g. from [`load_hamr`](@ref).
+- `maxlevel`: per-direction caps on the output refinement level, a `NamedTuple` with any of the keys `r`, `θ`, `φ`;
+  each a nonnegative integer, or `nothing` for no cap.
+
+# Returns
+- `GRMHDSnapshot` on a `TensorGrid`, `fluid` indexed `(:φ, :θ, :r)`, with the same fields, `R` and scalars.
+"""
+function resample(snap::GRMHDSnapshot{<:Any, <:BlockGrid}; maxlevel::NamedTuple = (;))
+    keys(maxlevel) ⊆ (:r, :θ, :φ) || throw(ArgumentError("maxlevel keys must be among (:r, :θ, :φ), got $(keys(maxlevel))"))
+    all(l -> isnothing(l) || (l isa Integer && l ≥ 0), maxlevel) ||
+        throw(ArgumentError("maxlevel values must be nonnegative integers or nothing, got $maxlevel"))
+    g = snap.grid
+    A = parent(snap.fluid)
+    bs = reverse(size(A)[1:3])
+    nb = size(g.table) .>> Tuple(g.lmax)
+    tl = map((L, k) -> Int(min(something(get(maxlevel, k, nothing), L), L)), Tuple(g.lmax), (:r, :θ, :φ))
+    X(d, i) = _cell_center(g.startx[d], g.ext0[d], bs[d], tl[d], i)
+    n = nb .* bs .<< tl
+
+    # 0-based output radial cells; contiguous since r grows with the index
+    r_prof = map(i -> first(bl_coord(g.coords, X(1, i), X(2, 0))), 0:n[1]-1)
+    i1 = findfirst(∈(g.r_extent), r_prof); i2 = findlast(∈(g.r_extent), r_prof)
+    isnothing(i1) && throw(ArgumentError("no radial cell centres at level $(tl[1]) in r = $(g.r_extent)"))
+    ir = i1-1:i2-1
+    # their radial span must lie within the blocks: every table slot it meets is filled
+    slots = map(i -> i ÷ bs[1] + 1, _relevel(ir, g.lmax[1] - tl[1]))
+    all(!iszero, view(g.table, first(slots):last(slots), :, :)) || throw(ArgumentError(
+        "the radial cells at level $(tl[1]) with centres in r = $(g.r_extent) reach beyond the blocks of the snapshot"))
+    th_grid = [last(bl_coord(g.coords, X(1, i), X(2, j))) for i in ir, j in 0:n[2]-1]
+
+    outs = Array{eltype(A)}(undef, n[3], n[2], length(ir))
+    rcells(b) = _relevel(_cells(g.coord[b][1], bs[1]), tl[1] - g.level[b][1])
+    iscopy(b) = all(≥(0), tl .- Tuple(g.level[b]))
+    rel = filter(b -> !isempty(rcells(b) ∩ ir), eachindex(g.level))
+    # Float64 sums for averaged cells; weights add to 1 per output cell since blocks tile, `w > 0` marks them
+    z = merge((; w = 0.0), map(x -> Float64.(x), _zero(eltype(A))))
+    # each task owns whole radial chunks of the output (a few per thread, for balance), so no two tasks write the same cell
+    @tasks for cr in chunks(ir; n = 4Threads.nthreads())
+        cbs = filter(b -> !isempty(rcells(b) ∩ cr), rel)
+        ro = first(cr) - first(ir)
+        sums = all(iscopy, cbs) ? nothing : fill(z, n[3], n[2], length(cr))
+        foreach(b -> _scatter!(iscopy(b) ? outs : sums, ro, view(A, :, :, :, b), g.level[b], g.coord[b], tl, cr), cbs)
+        isnothing(sums) || foreach(CartesianIndices(sums)) do I
+            k, j, i = Tuple(I)
+            iszero(sums[I].w) || (outs[k, j, i + ro] = convert(eltype(outs), NamedTuple{fieldnames(eltype(outs))}(sums[I])))
+        end
+    end
+    GRMHDSnapshot(NamedDimsArray(outs, (:φ, :θ, :r)), TensorGrid(r_prof[ir .+ 1], th_grid, X(3, 0), g.ext0[3]/(bs[3] << tl[3])),
+                  snap.R, snap.spin, snap.gam, snap.t, snap.M_unit, snap.MBH)
+end
+
+# The cells `B` (φ, θ, r) of a block at level `l` and position `c` into those output cells at levels `tl` they overlap
+# whose radial index is in `cr` (radial index local to `cr`), each weighted by its overlap.
+function _scatter!(sink, ro, B, l, c, tl, cr)
+    bs = reverse(size(B))
+    s = tl .- Tuple(l)
+    w = exp2(sum(min.(s, 0)))
+    o = Tuple(c) .* bs
+    for i in _relevel(cr, -s[1]) ∩ _cells(c[1], bs[1]), jl in 1:bs[2], kl in 1:bs[3]
+        x = B[kl, jl, i - o[1] + 1]
+        j = o[2] + jl - 1; k = o[3] + kl - 1
+        for it in _relevel(i:i, s[1]) ∩ cr, jo in _relevel(j:j, s[2]), ko in _relevel(k:k, s[3])
+            @inbounds _put!(sink, ro, ko + 1, jo + 1, it - first(cr) + 1, x, w)
+        end
+    end
+end
+
+# A stored record `x` of weight `w` into the output records (radial offset `ro`), copied, or into the sums, accumulated
+# with its weight.
+Base.@propagate_inbounds _put!(outs::AbstractArray{R}, ro, k, j, i, x::R, w) where {R} = outs[k, j, i + ro] = x
+Base.@propagate_inbounds _put!(sums::AbstractArray, ro, k, j, i, x, w) =
+    sums[k, j, i] = map((y, v) -> y + w*v, sums[k, j, i], merge((; w = 1.0), x))
 
 """
     r_min(snapshot)

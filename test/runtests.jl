@@ -383,7 +383,7 @@ end
     # each snapshot with in-grid radii; the H-AMR one with spin along grid z, so R is the identity
     dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
     hamr = if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
-        ((load_hamr(dir; rcyl = nothing, spin_axis = (0, 0, 1), rmin = 4, rmax = 4.2), (4.07, 4.13, 4.19)),)
+        ((resample(load_hamr(dir; rcyl = nothing, spin_axis = (0, 0, 1), rmin = 4, rmax = 4.2)), (4.07, 4.13, 4.19)),)
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
         ()
@@ -801,7 +801,7 @@ end
 
     dir = joinpath(@__DIR__, "data", "hamr_dumps1000")
     if isfile(joinpath(dir, "parameters"))
-        snap = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235)      # the innermost 5 radial cells, all fields
+        snap = resample(load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235))      # the innermost 5 radial cells, all fields
         @test size(snap.fluid) == (1024, 1056, 5)
         @test snap.t == 5993.937771363162 && snap.spin == 0.9375 && snap.gam == 4/3
         @test snap.grid.dφ ≈ 2π/1024 && snap.grid.φ0 ≈ π/1024
@@ -809,9 +809,14 @@ end
         @test snap.grid.th_grid[1, 23] ≈ 0.09683481083775666 rtol = 1e-14
         @test all(c -> c.ρ > 0, snap.fluid)
         @test all(c -> all(isfinite, c.ũ) && all(isfinite, c.B), snap.fluid)
-        @test load_snapshot(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.221).fluid == snap.fluid[r=1:2]
+        # load_snapshot is load_hamr: the native blocks
+        sl = load_snapshot(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.221)
+        sh = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.221)
+        @test sl.grid isa BlockGrid && sl.grid.level == sh.grid.level && sl.grid.coord == sh.grid.coord && sl.grid.r_extent == sh.grid.r_extent
+        @test parent(sl.fluid) == parent(sh.fluid)
+        @test resample(sl).fluid == snap.fluid[r=1:2]
         # partial: the requested fields in the order (ρ, ũ, B), the same data
-        sp = load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235, fields = (:B, :ρ))
+        sp = resample(load_hamr(dir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235, fields = (:B, :ρ)))
         @test eltype(sp.fluid) == @NamedTuple{ρ::Float32, B::SVector{3,Float32}}
         @test sp.fluid == map(c -> (; c.ρ, c.B), snap.fluid)
 
@@ -896,7 +901,7 @@ end
     dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
     if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
         # the run's spin lies along grid −x
-        ld(; kw...) = load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), kw...)
+        ld(; maxlevel = (;), kw...) = resample(load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), kw...); maxlevel)
         # r ∈ [4, 4.2]: blocks at levels (r, θ, φ) = (1, 1, 1), (1, 1, 0), (0, 0, 1) ⇒ output at level 1 in each direction
         snap = ld(rmin = 4, rmax = 4.2)
         @test snap.t == 250000.0048901291 && snap.spin == 0.9375
@@ -960,7 +965,7 @@ end
             maximum(((ii, jj, kk),) -> abs(u0[φ=25+kk, θ=17+jj, r=ii-3]/raw(6, ii, jj, kk)[3] - 1), cells)
         end
         @test u0dev(snap) < 1e-2
-        @test all(a -> u0dev(load_hamr(dir; rcyl = nothing, spin_axis = a, rmin = 4, rmax = 4.2)) > 1e-2, ((0, 0, 1), (1, 0, 0)))
+        @test all(a -> u0dev(resample(load_hamr(dir; rcyl = nothing, spin_axis = a, rmin = 4, rmax = 4.2))) > 1e-2, ((0, 0, 1), (1, 0, 0)))
 
         # gas angular momentum L = Σ ρ x × v dV along the spin: x, v spin-frame Cartesian, dV = r² sinθ dr dθ dφ ∝ r³ sinθ
         # (dr ∝ r, dθ and dφ uniform)
@@ -1026,11 +1031,128 @@ end
 
         # auto-detection without any grid argument; units independently optional
         @test snapshot_format(dir) === :hamr
-        @test load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid == map(c -> (; c.ρ), snap.fluid)
+        # load_snapshot is load_hamr: the native blocks, resampled to the same data
+        sl = load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,))
+        @test sl.grid isa BlockGrid && parent(sl.fluid) == parent(load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid)
+        @test resample(sl).fluid == map(c -> (; c.ρ), snap.fluid)
         snapb = ld(rmin = 4, rmax = 4.1, fields = (:ρ,), MBH = 6.5e9)
         @test snapb.MBH === 6.5e9 && snapb.M_unit === nothing && lunit(snapb) ≈ 9.598062747325812e14
     else
         @test_skip "H-AMR new-layout dump dir or gdumps absent"
+    end
+end
+
+@testitem "H-AMR native loader: stored blocks (optional, isfile-guarded)" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: sample, HAMRSph, HAMRCyl, _hamr_parameters, _hamr_blocks, _tospin, _sample_frame
+    using GRMHDSnapshots.IntervalSets: Interval, (..)
+
+    dir = joinpath(@__DIR__, "data", "hamr_dumps10000")
+    if isfile(joinpath(dir, "parameters")) && isfile(joinpath(@__DIR__, "data", "gdumps", "grid"))
+        ld(; kw...) = load_hamr(dir; rcyl = nothing, spin_axis = (-1, 0, 0), kw...)
+        par = _hamr_parameters(joinpath(dir, "parameters")); bs = par.bs
+        R = SMatrix{3,3,Int}(0, 0, -1, 0, 1, 0, 1, 0, 0)
+        lv(t) = SVector{3,Int32}(t)
+
+        # against the uncapped resample, one level (r ∈ [4, 4.2]) and across the ring edge r = 3.7751… (levels
+        # (0, 0, 1) and up to (1, 1, 1)): each uniform cell is a copy of one stored cell, found by integer index arithmetic
+        # through the table, so bit-identical. `sample` at the uniform cell centre must give that record through `_tospin`
+        # exactly; the uniform `sample` there is trilinear with weights 0/1 only up to rounding, so not an exact reference.
+        for (rmin, rmax) in ((4, 4.2), (3.6, 3.81))
+            sn = ld(; rmin, rmax)
+            u = resample(sn)
+            g = sn.grid; L = g.lmax; A = parent(sn.fluid)
+            @test g isa BlockGrid && g.coords === HAMRSph() && dimnames(sn.fluid) == (:φ, :θ, :r, :block)
+            @test A isa Array{@NamedTuple{ρ::Float32, ũ::SVector{3,Float32}, B::SVector{3,Float32}}, 4}
+            @test size(A)[1:3] == reverse(bs) && g.level isa Vector{SVector{3,Int32}} && g.coord isa Vector{SVector{3,Int32}}
+            @test g.startx === SVector(par.startx) && g.ext0 === SVector(par.dx .* bs)
+            @test (sn.R, sn.spin, sn.gam, sn.t, sn.M_unit, sn.MBH) === (Val(R), u.spin, u.gam, u.t, nothing, nothing)
+            # the uniform output is at the native finest level
+            @test size(u.fluid)[1:2] == (par.nb[3]*bs[3] << L[3], par.nb[2]*bs[2] << L[2])
+            @test log(u.grid.r_prof[2]/u.grid.r_prof[1]) ≈ par.dx[1]/2^L[1] rtol = 1e-10
+            i0 = round(Int, (log(u.grid.r_prof[1]) - par.startx[1])/(par.dx[1]/2^L[1]) - 1/2)
+            ok = map(CartesianIndices(parent(u.fluid))) do I
+                k, j, i = Tuple(I) .- 1
+                c = (i0 + i, j, k)                  # 0-based level-L cell
+                b = g.table[ntuple(d -> c[d] ÷ bs[d] + 1, 3)...]
+                l = ntuple(d -> (c[d] >> (L[d] - g.level[b][d])) - g.coord[b][d]*bs[d], 3)
+                rec = A[l[3]+1, l[2]+1, l[1]+1, b]
+                r = u.grid.r_prof[i+1]; θ = u.grid.th_grid[i+1, j+1]; φ = u.grid.φ0 + k*u.grid.dφ
+                q = r*SVector(sin(θ)*cos(φ), sin(θ)*sin(φ), cos(θ)); p = R*q
+                (rec === parent(u.fluid)[I], sample(sn, p...) == map(x -> _tospin(x, _sample_frame(R, p, q)), rec))
+            end
+            @test all(first, ok) && all(last, ok)
+        end
+
+        # radial selection: exactly the blocks overlapping the range, in dump order; every table slot whose radial span
+        # meets r_extent is filled
+        blocks = _hamr_blocks(dir, par)
+        ext(c, l) = Interval(exp.(par.startx[1] .+ (c, c + 1) .* (bs[1]*par.dx[1]/2^l))...)
+        rgrid = exp(par.startx[1])..exp(par.startx[1] + par.nb[1]*bs[1]*par.dx[1])
+        for (rmin, rmax) in ((4, 4.2), (3.6, 3.7751454194494656), (nothing, 2.0), (2e5, nothing), (4.1, 4.1))
+            g = ld(; rmin, rmax, fields = (:ρ,)).grid
+            rsel = something(rmin, 0)..something(rmax, Inf)
+            want = filter(b -> !isempty(ext(b.coord[1], b.level[1]) ∩ rsel), blocks)
+            @test g.level == map(lv, want.level) && g.coord == map(lv, want.coord)
+            @test g.r_extent == rsel ∩ rgrid
+            @test all(I -> isempty(ext(I[1] - 1, g.lmax[1]) ∩ g.r_extent) || !iszero(g.table[I]), CartesianIndices(g.table))
+        end
+        full = ld(fields = (:ρ,))
+        @test length(full.grid.level) == length(par.ids) == size(full.fluid, 4)
+        @test all(!iszero, full.grid.table) && full.grid.r_extent == rgrid
+        @test full.grid.lmax == lv(maximum(b -> b.level[d], blocks) for d in 1:3)
+        full = nothing
+        @test_throws "no grid radii" ld(rmin = 2e6)
+        @test_throws ArgumentError ld(rmax = 1.0)
+        @test_throws ArgumentError ld(rmin = 5, rmax = 4)
+
+        # fields: the same data, keys in the order (ρ, ũ, B)
+        s = ld(rmin = 4, rmax = 4.2)
+        for f in ((:B, :ρ), (:ũ,), (:ρ,), (:B, :ũ))
+            sp = ld(rmin = 4, rmax = 4.2, fields = f)
+            ks = filter(in(f), (:ρ, :ũ, :B))
+            @test fieldnames(eltype(sp.fluid)) == ks
+            @test parent(sp.fluid) == map(c -> c[ks], parent(s.fluid))
+            @test sp.grid.table == s.grid.table && sp.grid.level == s.grid.level
+        end
+        @test_throws ArgumentError ld(rmin = 4, rmax = 4.2, fields = ())
+        @test_throws ArgumentError ld(rmin = 4, rmax = 4.2, fields = (:ρ, :u))
+        @test load_snapshot(dir; rcyl = nothing, spin_axis = (-1, 0, 0), rmin = 4, rmax = 4.2, fields = (:ρ,)).fluid ==
+              map(c -> (; c.ρ), s.fluid)
+
+        # the spin direction: u⁰ rebuilt from the loaded ũ in the spin-frame metric reproduces the stored u⁰ at every cell of
+        # block 25969 (= new_dump6 slot 0, levels (1, 1, 1), COORD (2, 1, 1)), as for the uniform loader; with the spin
+        # along another axis it does not. Stored cells: 9 float32, φ fastest, then θ, then r.
+        b = only(findall(b -> s.grid.level[b] == lv((1, 1, 1)) && s.grid.coord[b] == lv((2, 1, 1)), eachindex(s.grid.level)))
+        stored = reshape(ltoh.(reinterpret(Float32, read(joinpath(dir, "new_dump6"), 4*9*prod(bs)))), 9, reverse(bs)...)
+        u0dev(s) = let u0 = parent(map_plasma((ps, _, _) -> ps.u[1], s))
+            maximum(I -> abs(u0[Tuple(I)..., b]/stored[3, I] - 1), CartesianIndices(reverse(bs)))
+        end
+        @test map(c -> c.ρ, parent(s.fluid)[:, :, :, b]) == stored[1, :, :, :]
+        @test u0dev(s) < 1e-2
+        @test all(a -> u0dev(load_hamr(dir; rcyl = nothing, spin_axis = a, rmin = 4, rmax = 4.2)) > 1e-2, ((0, 0, 1), (1, 0, 0)))
+
+        # type-stable and allocation-free lookup
+        q = R*(4.1*SVector(0.3, -0.5, 0.8)/sqrt(0.98))
+        @inferred sample(s, q...)
+        alloc(s, q) = @allocated sample(s, q...)
+        alloc(s, q)
+        @test alloc(s, q) == 0
+    else
+        @test_skip "H-AMR new-layout dump dir or gdumps absent"
+    end
+
+    # old layout, cylindrified θ: loads, the grid maps work, point lookup does not
+    odir = joinpath(@__DIR__, "data", "hamr_dumps1000")
+    if isfile(joinpath(odir, "parameters"))
+        so = load_hamr(odir; rcyl = 24.32, spin_axis = (0, 0, 1), rmax = 1.235)      # the innermost ring of blocks
+        @test so.grid isa BlockGrid && so.grid.coords isa HAMRCyl && size(so.fluid)[1:3] == (32, 22, 134)
+        @test so.grid.r_extent == 1.2131867454091887..1.235 && all(l -> l[1] == l[2] == 0, so.grid.level)
+        @test all(isfinite, flow_speed(so))
+        @test all(isfinite, map_plasma((ps, _, _) -> ps.bsq, so))
+        @test_throws "resample" sample(so, 1.22, 0.0, 0.1)
+    else
+        @test_skip "H-AMR dump dir absent"
     end
 end
 
@@ -1205,6 +1327,80 @@ end
         @test typeof(vi) == typeof(vo) && eltype(vi.ũ) == eltype(vi.B) == P
         @test vo == map(zero, vi)
     end
+end
+
+@testitem "resample: BlockGrid → TensorGrid on synthetic grids" begin
+    using StaticArrays, NamedDims
+    using GRMHDSnapshots: HAMRSph, bl_coord
+    using GRMHDSnapshots.IntervalSets: Interval
+
+    I3 = Val(one(SMatrix{3,3,Int}))
+    mk(A, grid) = GRMHDSnapshot(NamedDimsArray(A, ndims(A) == 3 ? (:φ, :θ, :r) : (:φ, :θ, :r, :block)), grid, I3, 0.9, 4/3, 1.5, 2.0, 3.0)
+
+    # one level: 2×2×2 level-0 blocks of 4×3×5 cells (r, θ, φ) reproduce the tensor grid of the same cells exactly
+    nb = (2, 2, 2); bs = (4, 3, 5); n = nb .* bs
+    startx = SVector(log(2.0), -0.9, 0.3); ext0 = SVector((log(100.0) - log(2.0))/2, 0.9, π)
+    cen(d, i) = startx[d] + (2i + 1)*(ext0[d]/(2bs[d]))
+    r_prof = map(i -> first(bl_coord(HAMRSph(), cen(1, i), cen(2, 0))), 0:n[1]-1)
+    th_grid = [last(bl_coord(HAMRSph(), cen(1, i), cen(2, j))) for i in 0:n[1]-1, j in 0:n[2]-1]
+    tg = TensorGrid(r_prof, th_grid, cen(3, 0), ext0[3]/bs[3])
+    T = [(ρ = 1f0 + i + 0.1f0j + 0.01f0k, ũ = SVector{3,Float32}(sin(i + j), cos(k), -0.5j), B = SVector{3,Float32}(k, -i, j))
+         for k in 0:n[3]-1, j in 0:n[2]-1, i in 0:n[1]-1]
+    coord = vec([SVector{3,Int32}(a, b, c) for a in 0:1, b in 0:1, c in 0:1])
+    level = fill(zero(SVector{3,Int32}), length(coord))
+    blocks = stack(c -> T[c[3]*bs[3] .+ (1:bs[3]), c[2]*bs[2] .+ (1:bs[2]), c[1]*bs[1] .+ (1:bs[1])], coord)
+    sb = mk(blocks, BlockGrid(HAMRSph(), level, coord, nb, startx, ext0, tg.r_extent))
+    st = mk(T, tg)
+    sr = resample(sb)
+    @test sr.grid.r_prof == tg.r_prof && sr.grid.th_grid == tg.th_grid && sr.grid.φ0 === tg.φ0 && sr.grid.dφ === tg.dφ
+    @test sr.grid.r_extent == tg.r_extent
+    @test dimnames(sr.fluid) == (:φ, :θ, :r) && parent(sr.fluid) isa Array{eltype(T), 3} && parent(sr.fluid) == T
+    @test (sr.R, sr.spin, sr.gam, sr.t, sr.M_unit, sr.MBH) === (st.R, st.spin, st.gam, st.t, st.M_unit, st.MBH)
+    # caps at or above the grid's level change nothing
+    @test parent(resample(sb; maxlevel = (r = 0, θ = nothing, φ = 3)).fluid) == T
+
+    # two levels: one level-0 block of 2×1×2 cells (r, θ, φ) on φ ∈ [0, π); [π, 2π) refined in r and φ into 4 blocks at
+    # level (1, 0, 1). Cell (i, k) of refined block (rc, pc) holds ρ = 100rc + 10pc + 2i + k, of the level-0 one 1000 + 2i + k.
+    nb2 = (1, 1, 2)
+    lv(t...) = SVector{3,Int32}(t)
+    coord2 = [lv(0, 0, 0), lv(0, 0, 2), lv(0, 0, 3), lv(1, 0, 2), lv(1, 0, 3)]
+    level2 = [lv(0, 0, 0), fill(lv(1, 0, 1), 4)...]
+    ρ(b, i, k) = b == 1 ? 1000 + 2i + k : 100coord2[b][1] + 10coord2[b][3] + 2i + k
+    rec(x) = (ρ = Float32(x), ũ = SVector{3,Float32}(x, -x, 0))
+    F = [rec(ρ(b, i, k)) for k in 0:1, j in 0:0, i in 0:1, b in 1:5]
+    g2(blk, rext) = BlockGrid(HAMRSph(), level2[blk], coord2[blk], nb2, SVector(0.0, -0.5, 0.0), SVector(log(4.0), 1.0, π), rext)
+    s2 = mk(F, g2(1:5, Interval(1.0, 4.0)))
+    ρs(s) = map(c -> c.ρ, parent(s.fluid)[:, 1, :])
+    vecok(s) = all(c -> c.ũ == SVector(c.ρ, -c.ρ, 0), parent(s.fluid))
+
+    # uncapped, level (1, 0, 1): every output cell a copy
+    u = resample(s2)
+    @test size(u.fluid) == (8, 1, 4) && vecok(u)
+    @test ρs(u) == [k ≤ 4 ? 1000 + 2((i - 1) >> 1) + ((k - 1) >> 1) :
+                            100((i - 1) >> 1) + 10(2 + (k - 5) >> 1) + 2((i - 1) & 1) + ((k - 5) & 1) for k in 1:8, i in 1:4]
+    @test u.grid.r_prof ≈ 4 .^ ((1:2:7) ./ 8) rtol = 1e-14
+    @test u.grid.th_grid ≈ fill(π/2, 4, 1) rtol = 1e-14
+    @test u.grid.φ0 ≈ π/8 && u.grid.dφ ≈ π/4
+    # φ capped to level 0: the level-0 block copied, the refined φ pairs averaged
+    p = resample(s2; maxlevel = (φ = 0,))
+    @test size(p.fluid) == (4, 1, 4) && vecok(p) && eltype(parent(p.fluid)) == eltype(F)
+    @test ρs(p) == [1000 1000 1002 1002; 1001 1001 1003 1003; 20.5 22.5 120.5 122.5; 30.5 32.5 130.5 132.5]
+    @test p.grid.φ0 ≈ π/4 && p.grid.dφ ≈ π/2
+    # r and φ capped to level 0: refined 2×2 groups averaged
+    q = resample(s2; maxlevel = (r = 0, φ = 0))
+    @test size(q.fluid) == (4, 1, 2) && vecok(q)
+    @test ρs(q) == [1000 1002; 1001 1003; 21.5 121.5; 31.5 131.5]
+    @test q.grid.r_prof ≈ [sqrt(2), 2sqrt(2)] rtol = 1e-14
+
+    # radial cells: those with centres in r_extent; the blocks must cover them
+    @test resample(mk(F[:, :, :, 1:3], g2(1:3, Interval(1.0, 1.9)))).fluid == u.fluid[r = 1:2]
+    @test_throws "reach beyond the blocks" resample(mk(F[:, :, :, 1:3], g2(1:3, Interval(1.0, 4.0))))
+    @test_throws "no radial cell centres" resample(mk(F, g2(1:5, Interval(1.5, 1.6))))
+
+    # maxlevel validation
+    @test_throws "maxlevel keys" resample(s2; maxlevel = (z = 1,))
+    @test_throws "nonnegative integers" resample(s2; maxlevel = (r = -1,))
+    @test_throws ArgumentError resample(s2; maxlevel = (θ = 1.5,))
 end
 
 @testitem "_" begin
