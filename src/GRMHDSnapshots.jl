@@ -610,9 +610,9 @@ finest level among its blocks, capped by `maxlevel`. The radial cells are those 
 grid's `r_extent`; θ and φ span the whole grid.
 
 Each output cell is the average of the stored cells it overlaps, weighted by the overlap in native coordinates: a coarser
-or equal stored cell is copied into every output cell it covers, finer ones are averaged (in `Float64`, stored in the
-fluid's own precision). Without caps every output cell is a copy of one stored cell. Throws if an output cell reaches
-beyond the snapshot's blocks.
+or equal stored cell is copied into every output cell it covers, finer ones are averaged in the fluid's own precision.
+Without caps every output cell is a copy of one stored cell. Throws if an output cell reaches beyond the snapshot's
+blocks.
 
 # Arguments
 - `snapshot`: `GRMHDSnapshot` on a `BlockGrid`, e.g. from [`load_hamr`](@ref).
@@ -649,8 +649,8 @@ function resample(snap::GRMHDSnapshot{<:Any, <:BlockGrid}; maxlevel::NamedTuple 
     rcells(b) = _relevel(_cells(g.coord[b][1], bs[1]), tl[1] - g.level[b][1])
     iscopy(b) = all(≥(0), tl .- Tuple(g.level[b]))
     rel = filter(b -> !isempty(rcells(b) ∩ ir), eachindex(g.level))
-    # Float64 sums for averaged cells; weights add to 1 per output cell since blocks tile, `w > 0` marks them
-    z = merge((; w = 0.0), map(x -> Float64.(x), _zero(eltype(A))))
+    # sums for averaged cells, in the fluid's precision; weights add to 1 per output cell since blocks tile, `w > 0` marks them
+    z = merge((; w = zero(promote_type(map(eltype, fieldtypes(eltype(A)))...))), _zero(eltype(A)))
     # each task owns whole radial chunks of the output (a few per thread, for balance), so no two tasks write the same cell
     @tasks for cr in chunks(ir; n = 4Threads.nthreads())
         cbs = filter(b -> !isempty(rcells(b) ∩ cr), rel)
@@ -683,10 +683,13 @@ function _scatter!(sink, ro, B, l, c, tl, cr)
 end
 
 # A stored record `x` of weight `w` into the output records (radial offset `ro`), copied, or into the sums, accumulated
-# with its weight.
+# with its weight in the sums' precision (exact: `w` is a power of two).
 Base.@propagate_inbounds _put!(outs::AbstractArray{R}, ro, k, j, i, x::R, w) where {R} = outs[k, j, i + ro] = x
-Base.@propagate_inbounds _put!(sums::AbstractArray, ro, k, j, i, x, w) =
-    sums[k, j, i] = map((y, v) -> y + w*v, sums[k, j, i], merge((; w = 1.0), x))
+Base.@propagate_inbounds function _put!(sums::AbstractArray, ro, k, j, i, x, w)
+    s = sums[k, j, i]
+    ws = oftype(s.w, w)
+    sums[k, j, i] = map((y, v) -> y + ws*v, s, merge((; w = one(ws)), x))
+end
 
 """
     r_min(snapshot)
