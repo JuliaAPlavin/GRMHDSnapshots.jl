@@ -56,7 +56,8 @@ Load a single GRMHD snapshot, auto-detecting the on-disk format:
 - a `.../RUN.zarr/snapNNNN` path → koral Zarr ([`load_koral`](@ref));
 - a directory with `parameters` and `new_dump0` → H-AMR, either `parameters` layout ([`load_hamr`](@ref); needs its `rcyl` and `spin_axis` kwargs).
 
-`kwargs...` go to the selected loader (e.g. `M_unit`/`MBH` for iharm); use the explicit loaders for full control.
+`kwargs...` go to the selected loader. Every loader accepts `fields` (a nonempty subset of `(:ρ, :ũ, :B)`) and
+`M_unit`/`MBH`; use the explicit loaders for their format-specific options.
 """
 function load_snapshot(path::AbstractString; kwargs...)
     p = rstrip(path, '/')
@@ -91,12 +92,14 @@ Load a raw `.h5` snapshot or a Zarr snapshot path.
 
 # Arguments
 - `path`: `.h5` file, or `.../RUN.zarr/snapNNNN` store snapshot path.
-- `kwargs...`: Forwarded to the selected loader; both take `M_unit = nothing, MBH = nothing` (g, M☉), each overriding
-  the header's value independently. Without them the header units are used for radiative runs only, as described for
-  the store method `load_koral(store, snapname)`.
+- `kwargs...`: Forwarded to the selected loader; both take `fields = (:ρ, :ũ, :B)` (the fluid fields to read, a
+  nonempty subset of these) and `M_unit = nothing, MBH = nothing` (g, M☉), each overriding the header's value
+  independently. Without them the header units are used for radiative runs only, as described for the store method
+  `load_koral(store, snapname)`.
 
 # Returns
-- `GRMHDSnapshot`.
+- `GRMHDSnapshot` whose `fluid` records hold the requested fields, in the order `(ρ, ũ, B)`; `Float64` for `.h5`,
+  `Float32` for Zarr.
 """
 function load_koral(path::AbstractString; kwargs...)
     p = rstrip(path, '/')
@@ -115,16 +118,18 @@ function _koral_units(radiative::Bool, hdr; M_unit, MBH)
      MBH = !isnothing(MBH) ? MBH : radiative ? h.M_bh : nothing)
 end
 
-function load_koral_h5(path::AbstractString; M_unit = nothing, MBH = nothing)
+function load_koral_h5(path::AbstractString; fields = (:ρ, :ũ, :B), M_unit = nothing, MBH = nothing)
+    ks = _fluid_keys(fields)
     h5open(path, "r") do h5
         rd(name) = read(h5["quants/$name"])
-        fluid = _interleave(map(names -> _koral_column(Float64, map(rd, names)), _KORAL_COMPONENTS))
+        fluid = _interleave(map(names -> _koral_column(Float64, map(rd, names)), _KORAL_COMPONENTS[ks]))
 
-        r = read(h5["grid_out/r"]); th = read(h5["grid_out/th"]); ph = read(h5["grid_out/ph"])
-        n1 = size(r, 3); n2 = size(r, 2); n3 = size(r, 1)
-        r_prof  = Float64[r[1, 1, i] for i in 1:n1]
-        th_grid = Float64[th[1, j, i] for i in 1:n1, j in 1:n2]
-        φ0_file = Float64(ph[1, 1, 1]); dφ = (Float64(ph[n3, 1, 1]) - φ0_file)/(n3 - 1)
+        # grid datasets are (φ, θ, r); read only the parts used: r along r, θ over (θ, r), φ along φ
+        n3 = size(h5["grid_out/r"], 1)
+        r_prof  = Float64.(h5["grid_out/r"][1, 1, :])
+        th_grid = Float64.(permutedims(h5["grid_out/th"][1, :, :]))
+        ph = h5["grid_out/ph"][:, 1, 1]
+        φ0_file = Float64(ph[1]); dφ = (Float64(ph[n3]) - φ0_file)/(n3 - 1)
         # ipole convention: file φ + π.
         φ0 = φ0_file + π
 

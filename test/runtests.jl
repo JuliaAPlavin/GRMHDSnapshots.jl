@@ -104,6 +104,19 @@ end
         (; ρ, ũ, B) = @inferred sample(s, 5.0, 0.0, 0.0)
         @test isfinite(ρ) && all(isfinite, ũ) && all(isfinite, B)
 
+        # the grid from slices equals that from the full arrays; a ρ-only load is the full load's ρ on the same grid
+        h5open(h5path, "r") do h5
+            r = read(h5["grid_out/r"]); th = read(h5["grid_out/th"]); ph = read(h5["grid_out/ph"])
+            n3, n2, n1 = size(r)
+            @test s.r_prof == Float64[r[1, 1, i] for i in 1:n1]
+            @test s.th_grid == Float64[th[1, j, i] for i in 1:n1, j in 1:n2]
+            @test s.φ0 == Float64(ph[1, 1, 1]) + π
+            @test s.dφ == (Float64(ph[n3, 1, 1]) - Float64(ph[1, 1, 1]))/(n3 - 1)
+        end
+        sρ = load_koral(h5path; fields = (:ρ,))
+        @test sρ.fluid == map(c -> c[(:ρ,)], s.fluid)
+        @test (sρ.r_prof, sρ.th_grid, sρ.φ0, sρ.dφ) == (s.r_prof, s.th_grid, s.φ0, s.dφ)
+
         s_store = load_koral(zopen(joinpath(@__DIR__, "data", "koral_sample.zarr"), "r"), "snap002000")
         sl = (1:6:144, 1:6:192, 1:6:288)
         scale_relerr(loaded, hpath) = h5open(h5path, "r") do h5
@@ -190,6 +203,20 @@ end
     @test s.fluid[φ=k, θ=j, r=i].ρ == quants.rho[k, j, i]
     @test s.fluid[φ=k, θ=j, r=i].ũ == SVector(quants.U1[k, j, i], quants.U2[k, j, i], quants.U3[k, j, i])
     @test s.fluid[φ=k, θ=j, r=i].B == SVector(quants.B1[k, j, i], quants.B2[k, j, i], quants.B3[k, j, i])
+
+    # partial loads: the requested fields only, in the order (ρ, ũ, B), each the same data; the grid is the same
+    using NamedDims
+    for (fields, K) in (((:ρ,), (:ρ,)), ((:ũ,), (:ũ,)), ((:B, :ρ), (:ρ, :B)), ((:ũ, :B), (:ũ, :B)))
+        sp = load_koral(h5paths[0]; fields)
+        @test fieldnames(eltype(sp.fluid)) == K
+        @test parent(sp.fluid) isa Array && dimnames(sp.fluid) == (:φ, :θ, :r)
+        @test sp.fluid == map(c -> c[K], s.fluid)
+        @test (sp.r_prof, sp.th_grid, sp.φ0, sp.dφ) == (s.r_prof, s.th_grid, s.φ0, s.dφ)
+    end
+    @test_throws ArgumentError load_koral(h5paths[0]; fields = ())
+    @test_throws ArgumentError load_koral(h5paths[0]; fields = (:rho,))
+    sρ = load_snapshot(h5paths[0]; fields = (:ρ,))
+    @test sρ.fluid == map(c -> c[(:ρ,)], s.fluid) && sρ.th_grid == ths
 end
 
 @testitem "plasma physics" begin
