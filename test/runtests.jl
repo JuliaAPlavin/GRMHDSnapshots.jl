@@ -364,10 +364,10 @@ end
     @test_throws Unitful.DimensionError load_koral(store, "snap002000"; fields = (:ρ,), MBH = 6.5e9)
     @test_throws MethodError @set snap.M_unit = 5e-8
 
-    # Eddington mass unit: L_Edd/c² = 1.2572e38 erg/s / c² = 1.39883e17 g/s per M☉, t_g = 4.925491e-6 s per M☉
-    # ⇒ 6.8899e11 g·(MBH/M☉)², 0.013320 M☉ for 6.2e9 M☉
+    # Eddington mass unit, in plain CGS (CODATA 2018, IAU M☉): L_Edd/c² = 1.2570652e38 erg/s / c² per M☉, t_g = G·M☉/c³ per M☉
+    # ⇒ 6.8891544e11 g·(MBH/M☉)², 0.013318134 M☉ for 6.2e9 M☉
     @test GRMHDSnapshots._σT ≈ 6.6524587051e-25u"cm^2" rtol = 1e-8         # CODATA 2018/2022
-    @test eddington_mass_unit(6.2e9u"Msun") ≈ 0.013320u"Msun" rtol = 1e-3
+    @test eddington_mass_unit(6.2e9u"Msun") ≈ 0.013318134u"Msun" rtol = 1e-6
     @test eddington_mass_unit(6.2e9u"Msun") isa typeof(1.0u"Msun")
     @test eddington_mass_unit(12.4e9u"Msun") ≈ 4*eddington_mass_unit(6.2e9u"Msun") rtol = 1e-12
     @test eddington_mass_unit(uconvert(u"kg", 6.2e9u"Msun")) ≈ eddington_mass_unit(6.2e9u"Msun") rtol = 1e-12
